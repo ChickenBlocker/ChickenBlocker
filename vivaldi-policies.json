@@ -1,0 +1,10 @@
+{
+  "IncognitoModeAvailability": 1,
+  "ExtensionUpdateEnabled": false,
+  "ExtensionInstallForcelist": [
+    "blaaajhemilngeeffpbfkdjjoefldkok;https://clients2.google.com/service/update2/crx"
+  ],
+  "URLBlocklist": [
+    "chrome-extension://blaaajhemilngeeffpbfkdjjoefldkok/options.html"
+  ]
+}

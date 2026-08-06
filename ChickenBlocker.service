@@ -1,0 +1,29 @@
+[Unit]
+Description=ChickenBlocker enforcement daemon
+# RefuseManualStop blocks `systemctl stop ChickenBlocker`; dependency-driven
+# stops and shutdown are still allowed.
+RefuseManualStop=yes
+
+[Service]
+# The C daemon reads ./policies.json and ./userChrome.css from its working
+# directory. Both source assets are installed to /opt/ChickenBlocker (see Makefile).
+WorkingDirectory=/opt/ChickenBlocker
+# ChickenBlocker: C port of main.py. The binary name becomes the kernel `comm`
+# ("ChickenBlocker"), giving the BPF LSM signal blocker a precise match.
+ExecStart=/opt/ChickenBlocker/ChickenBlocker
+Restart=on-failure
+RestartForceExitStatus=SIGTERM
+RestartSec=2s
+
+# --- Hardening (raise the bar against self-disabling) ---
+# SendSIGKILL=no: on any systemd-driven stop, do NOT escalate to SIGKILL after
+# TimeoutStopSec. SIGKILL from anywhere is denied by the BPF LSM. An external
+# SIGTERM is force-restarted; a real systemd stop suppresses restart normally.
+SendSIGKILL=no
+TimeoutStopSec=3s
+
+[Install]
+# WantedBy=ChickenBlocker.target (not multi-user.target directly) so that the
+# ChickenBlocker.target.wants/ directory can be made immutable to block
+# `systemctl disable ChickenBlocker`. See ChickenBlocker.target for the full rationale.
+WantedBy=ChickenBlocker.target
