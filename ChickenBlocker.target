@@ -1,0 +1,43 @@
+[Unit]
+Description=ChickenBlocker activation target
+# Intermediate target that lets us block `systemctl disable ChickenBlocker` in a
+# ChickenBlocker-SPECIFIC way (does NOT affect other units).
+#
+# Mechanism:
+#   ChickenBlocker.service  -> WantedBy=ChickenBlocker.target   (this file)
+#   ChickenBlocker.target    -> WantedBy=multi-user.target
+#
+# When enabled, systemd creates:
+#   /etc/systemd/system/multi-user.target.wants/ChickenBlocker.target        -> ChickenBlocker.target
+#   /etc/systemd/system/ChickenBlocker.target.wants/ChickenBlocker.service        -> ChickenBlocker.service
+#
+# We then `chattr +i` the ChickenBlocker.target.wants/ DIRECTORY. An immutable
+# directory refuses unlink/rename of any entry inside it (kernel returns
+# EPERM), so when `systemctl disable ChickenBlocker` tries to unlink the
+# ChickenBlocker.service symlink from ChickenBlocker.target.wants/, it fails. This is
+# ChickenBlocker-specific because only ChickenBlocker's enable symlink lives in
+# ChickenBlocker.target.wants/.
+#
+# Why a dedicated target (and not the unit file's own inode): symlinks cannot
+# carry the immutable flag on ext4, and `chattr +i` on the unit file inode does
+# NOT protect the .wants/ symlink (a separate inode) that `systemctl disable`
+# removes. Converting that symlink to a hardlink (sharing the immutable inode)
+# breaks systemd's enablement recognition (systemd only honors symlinks in
+# .wants/), so the unit stops auto-starting and `disable` trivially succeeds.
+# The immutable DIRECTORY avoids both problems: the symlink stays a real
+# symlink (enablement works) and its removal is blocked at the kernel level.
+#
+# Residual bypass (intentional; there is no ChickenBlocker-specific way to close it
+# via filesystem immutability alone): the TOP-level enable symlink
+# /etc/systemd/system/multi-user.target.wants/ChickenBlocker.target is in the SHARED
+# multi-user.target.wants/ directory, which we do NOT make immutable (it would
+# block enable/disable for every unit). So `systemctl disable ChickenBlocker.target`
+# still succeeds and prevents boot-time start of both target and service. The
+# already-running persistent instance is unaffected; only the next reboot is
+# affected. To close this bypass globally, run:
+#   sudo chattr +i /etc/systemd/system/multi-user.target.wants/
+# (blocks enable/disable for ALL units in multi-user.target.wants/).
+Documentation=man:systemd.target(5)
+
+[Install]
+WantedBy=multi-user.target
