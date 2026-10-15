@@ -391,6 +391,86 @@ static void launch_firefox(struct passwd *pw) {
 // Is a process named "vivaldi-bin" currently running? (pgrep -x exact match on comm)
 static int vivaldi_running(void) { return proc_running("vivaldi-bin"); }
 
+static ssize_t read_proc_blob(pid_t pid, const char *name, char *buf, size_t bufsz) {
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/%s", pid, name);
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return -1;
+	ssize_t n = read(fd, buf, bufsz);
+	close(fd);
+	return n;
+}
+
+// /proc/<pid>/{cmdline,environ} are NUL-separated lists. Vivaldi accepts
+// profile roots from command-line switches and Chromium environment variables;
+// managed policy does not reliably override --user-data-dir in Vivaldi.
+static int nul_list_has_switch(const char *buf, size_t n, const char *key) {
+	size_t klen = strlen(key);
+	for (size_t off = 0; off + klen <= n; off++) {
+		if (off > 0 && buf[off - 1] != '\0' &&
+		    !isspace((unsigned char)buf[off - 1]))
+			continue;
+		if (memcmp(buf + off, key, klen) != 0) continue;
+		if (off + klen == n || buf[off + klen] == '\0' ||
+		    buf[off + klen] == '=' || isspace((unsigned char)buf[off + klen]))
+			return 1;
+	}
+	return 0;
+}
+
+static int nul_env_path_differs(const char *buf, size_t n,
+		const char *key, const char *expected) {
+	size_t klen = strlen(key);
+	for (size_t off = 0; off < n;) {
+		size_t len = strnlen(buf + off, n - off);
+		if (len > klen && buf[off + klen] == '=' &&
+		    memcmp(buf + off, key, klen) == 0) {
+			const char *value = buf + off + klen + 1;
+			size_t vlen = len - klen - 1;
+			return strlen(expected) != vlen || memcmp(value, expected, vlen) != 0;
+		}
+		off += len + 1;
+	}
+	return 0;
+}
+
+static int vivaldi_process_uses_unmanaged_profile(pid_t pid, const char *home) {
+	char buf[65536];
+	ssize_t n = read_proc_blob(pid, "cmdline", buf, sizeof buf);
+	if (n > 0 &&
+	    (nul_list_has_switch(buf, (size_t)n, "--user-data-dir") ||
+	     nul_list_has_switch(buf, (size_t)n, "--profile-directory")))
+		return 1;
+
+	n = read_proc_blob(pid, "environ", buf, sizeof buf);
+	if (n <= 0) return 0;
+	char config[1024], vivaldi[1024];
+	snprintf(config, sizeof config, "%s/.config", home);
+	snprintf(vivaldi, sizeof vivaldi, "%s/.config/vivaldi", home);
+	return nul_env_path_differs(buf, (size_t)n, "CHROME_USER_DATA_DIR", vivaldi) ||
+	       nul_env_path_differs(buf, (size_t)n, "CHROME_CONFIG_HOME", config) ||
+	       nul_env_path_differs(buf, (size_t)n, "XDG_CONFIG_HOME", config);
+}
+
+static int vivaldi_unmanaged_profile_running(const char *home) {
+	DIR *d = opendir("/proc");
+	if (!d) return 0;
+	int found = 0;
+	struct dirent *de;
+	while ((de = readdir(d))) {
+		if (de->d_type != DT_DIR) continue;
+		char *e;
+		long id = strtol(de->d_name, &e, 10);
+		if (*e || id <= 0 || !proc_comm_eq((pid_t)id, "vivaldi-bin")) continue;
+		if (vivaldi_process_uses_unmanaged_profile((pid_t)id, home)) {
+			found = 1;
+			break;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
 // Send SIGTERM (directly, in-process -> keeps the unconfined AppArmor label
 // so snap Firefox's `signal (receive) peer=unconfined` allows it) to all
 // processes whose comm == name, then wait until none remain (or timeout_s
@@ -435,6 +515,16 @@ static void launch_vivaldi(struct passwd *pw) {
 	(void)setuid(pw->pw_uid);
 	execv("/usr/bin/vivaldi-stable", (char *[]){"/usr/bin/vivaldi-stable", NULL});
 	_exit(127);
+}
+
+static void enforce_vivaldi_managed_profile(struct passwd *pw, int dry) {
+	if (!vivaldi_unmanaged_profile_running(pw->pw_dir)) return;
+	printf("VIVALDI UNMANAGED PROFILE: terminating alternate profile\n");
+	if (dry) return;
+	if (term_and_wait("vivaldi-bin", 10) == 0)
+		launch_vivaldi(pw);
+	else
+		printf("vivaldi unmanaged-profile kill failed; retrying next cycle\n");
 }
 
 // --- SafeEyes: pomodoro + night block + AV-aware pause ---------------------
@@ -2590,6 +2680,7 @@ static void pause_run(struct passwd *pw, const char *ff_sync_sqlite,
 				if (c >= 0) { dirty |= pause_handle_conn(c, pw, ff_sync_sqlite, dry, st); close(c); }
 			}
 		} else sleep(1);
+		enforce_vivaldi_managed_profile(pw, dry);
 		time_t now = time(NULL);
 		if (st->phase == 1) {
 			int expired = 0;
@@ -2753,6 +2844,11 @@ int main(void) {
 	struct passwd *pw = getpwnam(username);
 	if (!pw) { perror("getpwnam"); return 1; }
 	const char *home = pw->pw_dir;
+
+	// Vivaldi's managed UserDataDir policy does not reliably override Chromium's
+	// profile switches. Tear down the complete process tree when any Vivaldi
+	// process uses an alternate profile, then restore the managed instance.
+	enforce_vivaldi_managed_profile(pw, dry);
 
 	char firefox_path[1024];
 	snprintf(firefox_path, sizeof firefox_path, "%s/snap/firefox/common/.mozilla/firefox", home);

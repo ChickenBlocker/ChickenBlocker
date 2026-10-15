@@ -56,6 +56,27 @@ int main(void) {
 	assert(!vt_mask_status("enabled"));
 	assert(!vt_mask_status("disabled"));
 
+	const char cmd_normal[] = "/opt/vivaldi/vivaldi-bin\0--no-first-run\0";
+	const char cmd_temp_eq[] = "/opt/vivaldi/vivaldi-bin\0--user-data-dir=/tmp/test\0";
+	const char cmd_temp_arg[] = "/opt/vivaldi/vivaldi-bin\0--user-data-dir\0/tmp/test\0";
+	const char cmd_temp_flat[] =
+		"/opt/vivaldi/vivaldi-bin --user-data-dir=/tmp/test --no-first-run\0";
+	const char cmd_profile[] = "/opt/vivaldi/vivaldi-bin\0--profile-directory=Profile 1\0";
+	assert(!nul_list_has_switch(cmd_normal, sizeof cmd_normal - 1, "--user-data-dir"));
+	assert(nul_list_has_switch(cmd_temp_eq, sizeof cmd_temp_eq - 1, "--user-data-dir"));
+	assert(nul_list_has_switch(cmd_temp_arg, sizeof cmd_temp_arg - 1, "--user-data-dir"));
+	assert(nul_list_has_switch(cmd_temp_flat, sizeof cmd_temp_flat - 1, "--user-data-dir"));
+	assert(nul_list_has_switch(cmd_profile, sizeof cmd_profile - 1, "--profile-directory"));
+
+	const char env_normal[] = "HOME=/home/test\0XDG_CONFIG_HOME=/home/test/.config\0";
+	const char env_temp[] = "HOME=/home/test\0XDG_CONFIG_HOME=/tmp/config\0";
+	assert(!nul_env_path_differs(env_normal, sizeof env_normal - 1,
+		"XDG_CONFIG_HOME", "/home/test/.config"));
+	assert(nul_env_path_differs(env_temp, sizeof env_temp - 1,
+		"XDG_CONFIG_HOME", "/home/test/.config"));
+	assert(!nul_env_path_differs(env_normal, sizeof env_normal - 1,
+		"CHROME_USER_DATA_DIR", "/home/test/.config/vivaldi"));
+
 	struct SafeEyesState state = {0};
 	time_t before_day = local_time_at(2026, 9, 21, 7, 59);
 	time_t hour_8 = local_time_at(2026, 9, 21, 8, 0);
