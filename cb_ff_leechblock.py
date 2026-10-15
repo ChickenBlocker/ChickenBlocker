@@ -61,7 +61,7 @@ if not os.path.isdir(_M_HOME):
 PKF_MANAGED_PATH = os.path.join(_M_HOME, "managed-storage", "%s.json" % PKF_EXT_ID)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cb_vv_leechblock import sites_to_regexps
+from cb_vv_leechblock import PKF_SET, sites_to_regexps
 
 
 # Infer the storage-sync-v2.sqlite path from Firefox's profiles.ini, mirroring
@@ -464,6 +464,17 @@ def cmd_kw_list():
         print("keywords: (empty)")
     else:
         print("keywords (%d): %s" % (len(url_words), " ".join(url_words)))
+    # Vivaldi keyword set: cb_vv_leechblock.py --sync-from builds LeechBlock
+    # set PKF_SET there from this same PKF manifest (title/body matching,
+    # closeTab, no badge) on the daemon's next cycle; the url-regex set 6 is
+    # mirrored from Firefox too.
+    print("--- Vivaldi keyword set (LeechBlock set %d, built from the PKF manifest) ---"
+          % PKF_SET)
+    if not kws:
+        print("keywords: (empty - set %d stays inactive in Vivaldi)" % PKF_SET)
+    else:
+        print("keywords (%d): %s" % (len(kws), " ".join(kws)))
+        print("titleOnly: %s, closeTab: true, active 24/7" % title_only)
 
 
 def cmd_kw_add(args):
@@ -584,14 +595,18 @@ SUBCOMMANDS
         Options: [--print]
 
     kw-list
-        Print BOTH keyword block lists:
+        Print ALL keyword block lists:
           - Page Keyword Filter extension (title/body matching; managed storage)
           - LeechBlock set 6 (URL-regex matching)
+          - Vivaldi keyword set (LeechBlock set 5, built from the PKF
+            manifest by the Vivaldi sync)
 
     kw-add "w1 w2 ..."
-        APPEND words to BOTH block lists in one shot:
+        APPEND words to the block lists in one shot:
           - Page Keyword Filter (title/body matching; managed storage at %s)
           - LeechBlock set 6 (URL-regex matching; storage-sync sqlite)
+          - Vivaldi keyword set (picked up from the PKF manifest by
+            cb_vv_leechblock.py --sync-from on the daemon's next cycle)
         The managed-storage write needs root. The LeechBlock write needs Firefox
         STOPPED (sqlite lock); if Firefox is running, the managed-storage part
         still succeeds and set 6 is skipped with a message (stop Firefox and

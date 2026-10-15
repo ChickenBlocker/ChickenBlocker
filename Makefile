@@ -102,7 +102,7 @@ check: daemon
 	@test -x src/ChickenBlocker && echo "daemon: ok"
 	@$(MAKE) -C src check
 	@bash -n configure-calendar.sh
-	@python3 -m unittest tests/test_cb_calendar_sync.py tests/test_safeeyes_meeting.py tests/test_cb_startwork_idle_reset.py
+	@python3 -m unittest tests/test_cb_calendar_sync.py tests/test_safeeyes_meeting.py tests/test_cb_startwork_idle_reset.py tests/test_cb_vv_leechblock.py
 
 sync-calendar:
 	@python3 cb_calendar_sync.py --request
