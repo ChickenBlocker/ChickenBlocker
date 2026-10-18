@@ -21,13 +21,11 @@ application.
 """
 
 import atexit
-import datetime
 import gettext
 import logging
 from importlib import metadata
 from pathlib import Path
 import re
-import time
 import typing
 
 import gi
@@ -106,18 +104,15 @@ class SafeEyes(Gtk.Application):
 
         self.active = False
         self._status = ""
-        self._suspend_next_break_delay: typing.Optional[int] = None
-        self._meeting_next_break_delay: typing.Optional[int] = None
-        self._meeting_pause_monotonic: typing.Optional[float] = None
-        # VENDORED PATCH (ChickenBlocker): preserve an in-progress break across
-        # system suspend. Upstream abandons the running break on suspend (it
-        # only carries the next-break delay across for WAITING/PRE_BREAK),
-        # which lets a user escape a break by closing the lid mid-break. We
-        # record the running break's type + remaining countdown at suspend and
-        # re-impose it (minus the suspend duration, which counts toward the
-        # break) on resume via SafeEyesCore.resume_break().
-        self._suspend_in_progress_break: typing.Optional[typing.Tuple] = None
-        self._suspend_in_progress_wall: typing.Optional[float] = None
+        # VENDORED PATCH (ChickenBlocker): ChickenBlocker owns ALL break
+        # timing. The daemon detects suspends via CLOCK_BOOTTIME deltas and
+        # imposes breaks explicitly (--impose-short/--impose-long) with the
+        # exact duration it wants; SafeEyes' own logind PrepareForSleep
+        # handler (which preserved work-interval delay across suspend and
+        # re-added it after wake) is REMOVED so the two schedulers can never
+        # fight. The core's break countdown is wall-clock based
+        # (_break_end_timestamp), so an overlay left up across a suspend still
+        # ends at its original deadline when the machine wakes.
         self.system_locale = system_locale
 
         self.__register_cli_arguments()
@@ -168,6 +163,22 @@ class SafeEyes(Gtk.Application):
                 None,
             )
 
+        # VENDORED PATCH (ChickenBlocker): daemon-imposed breaks. The daemon
+        # owns the pomodoro clock and shows overlays through these options
+        # (SECONDS argument), bypassing the (neutered) built-in scheduler.
+        for flag, desc in [
+            ("impose-short", "impose a SHORT break overlay now (arg: seconds)"),
+            ("impose-long", "impose a LONG break overlay now (arg: seconds)"),
+        ]:
+            self.add_main_option(
+                flag,
+                0,
+                GLib.OptionFlags.NONE,
+                GLib.OptionArg.STRING,
+                desc,
+                None,
+            )
+
     def __register_actions(self) -> None:
         actions = [
             ("show_about", self.show_about),
@@ -206,6 +217,32 @@ class SafeEyes(Gtk.Application):
         take_break_requested = bool(cli.get("take-break")) or break_type is not None
 
         return (take_break_requested, break_type)
+
+    @staticmethod
+    def _get_impose_request(cli) -> typing.Optional[typing.Tuple]:
+        # VENDORED PATCH (ChickenBlocker): parse --impose-short/--impose-long
+        # SECS into (BreakType, duration). Returns None when not requested.
+        short_requested = cli.get("impose-short")
+        long_requested = cli.get("impose-long")
+
+        if short_requested is None and long_requested is None:
+            return None
+        if short_requested is not None and long_requested is not None:
+            raise ValueError("Cannot combine --impose-short with --impose-long")
+
+        raw = short_requested if short_requested is not None else long_requested
+        try:
+            duration = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid duration for impose: {raw!r}") from None
+        if duration < 1 or duration > 7 * 24 * 3600:
+            raise ValueError(f"Impose duration out of range: {duration}")
+
+        break_type = (
+            BreakType.SHORT_BREAK if short_requested is not None
+            else BreakType.LONG_BREAK
+        )
+        return (break_type, duration)
 
     def do_handle_local_options(self, options):
         Gtk.Application.do_handle_local_options(self, options)
@@ -272,6 +309,8 @@ class SafeEyes(Gtk.Application):
                 options.contains("take-break")
                 or options.contains("short-break")
                 or options.contains("long-break")
+                or options.contains("impose-short")
+                or options.contains("impose-long")
             ):
                 return -1
 
@@ -308,6 +347,12 @@ class SafeEyes(Gtk.Application):
             command_line.printerr_literal(f"{error}\n")
             return 1
 
+        try:
+            impose_request = self._get_impose_request(cli)
+        except ValueError as error:
+            command_line.printerr_literal(f"{error}\n")
+            return 1
+
         if cli.get("status"):
             # this is only invoked remotely
             # this code runs in the primary instance, but will print to the output
@@ -332,6 +377,12 @@ class SafeEyes(Gtk.Application):
                 # exit, and crucially this keeps the primary ALIVE (vs. the old
                 # uncaught raise that crashed the whole process, generating an
                 # apport report and forcing a relaunch).
+                command_line.set_exit_status(1)
+                return 1
+        elif impose_request is not None:
+            if not self.impose_break(impose_request[0], impose_request[1]):
+                # Same retry contract as take_break: no armed scheduler wait
+                # yet (fresh launch). ChickenBlocker retries on non-zero exit.
                 command_line.set_exit_status(1)
                 return 1
 
@@ -392,7 +443,11 @@ class SafeEyes(Gtk.Application):
             self.context.state = State.START
             self.plugins_manager.start()  # Call the start method of all plugins
             self.safe_eyes_core.start()
-            self.handle_system_suspend()
+            # VENDORED PATCH (ChickenBlocker): no logind PrepareForSleep
+            # listener here. ChickenBlocker owns suspend/resume handling
+            # (boottime-monotonic suspend detection + explicit impose); the
+            # old handler re-armed the scheduler on wake and fought the
+            # daemon and the cb_startwork gate.
 
     def do_activate(self):
         logging.info("Application activated")
@@ -504,127 +559,6 @@ class SafeEyes(Gtk.Application):
 
         super().quit()
 
-    def handle_suspend_callback(self, sleeping):
-        """If the system goes to sleep, Safe Eyes stop the core if it is
-        already active.
-
-        If it was active, Safe Eyes will become active after wake up with the
-        same amount of active work time remaining.
-        """
-        if sleeping:
-            # Sleeping / suspending
-            if self.active:
-                logging.info("Stop Safe Eyes due to system suspend")
-                self._suspend_next_break_delay = None
-                self._suspend_in_progress_break = None
-                self._suspend_in_progress_wall = None
-                core = self.safe_eyes_core
-                if (
-                    self.context.state == State.BREAK
-                    and core._taking_break is not None
-                    and core._countdown is not None
-                ):
-                    # VENDORED PATCH (ChickenBlocker): a break is in progress.
-                    # Record its type + remaining countdown so we can re-impose
-                    # it on resume (minus the suspend duration). core.stop(True)
-                    # below still closes the screen + advances the queue;
-                    # resume_break() re-shows the same break type for the time
-                    # left. This closes the "close the lid mid-break to escape
-                    # it" gap that the daemon's 30s-sampled se_break_active
-                    # tracking can miss when a break starts <30s before suspend.
-                    self._suspend_in_progress_break = (
-                        core._taking_break.type,
-                        int(core._countdown),
-                    )
-                    self._suspend_in_progress_wall = (
-                        datetime.datetime.now().timestamp()
-                    )
-                    logging.info(
-                        "Suspend during break; will resume %ds remaining "
-                        "after wake",
-                        int(core._countdown),
-                    )
-                elif (
-                    self.context.state in (State.WAITING, State.PRE_BREAK)
-                    and core.scheduled_next_break_time is not None
-                ):
-                    self._suspend_next_break_delay = max(
-                        1,
-                        round(
-                            (
-                                core.scheduled_next_break_time
-                                - datetime.datetime.now()
-                            ).total_seconds()
-                        ),
-                    )
-                    logging.info(
-                        "Preserve %ds until the next break across suspend",
-                        self._suspend_next_break_delay,
-                    )
-                self.plugins_manager.stop()
-                self.safe_eyes_core.stop(True)
-        else:
-            # Resume from sleep
-            if self.active and self.safe_eyes_core.has_breaks():
-                core = self.safe_eyes_core
-                if self._suspend_in_progress_break is not None:
-                    # VENDORED PATCH (ChickenBlocker): re-impose the break that was
-                    # running at suspend, for the time left (the suspend itself
-                    # counts toward the break). Skip the normal core.start()
-                    # scheduler restart and go straight into the break.
-                    break_type, remaining = self._suspend_in_progress_break
-                    suspend_dur = int(
-                        datetime.datetime.now().timestamp()
-                        - (self._suspend_in_progress_wall or 0)
-                    )
-                    self._suspend_in_progress_break = None
-                    self._suspend_in_progress_wall = None
-                    left = int(remaining) - suspend_dur
-                    logging.info(
-                        "Resume in-progress break: %ds left (was %ds, "
-                        "suspend %ds)",
-                        left,
-                        int(remaining),
-                        suspend_dur,
-                    )
-                    if left > 0:
-                        self.plugins_manager.start()
-                        core.running = True
-                        core.resume_break(break_type, left)
-                        return
-                    # else: the suspend outlasted the break -> the break is
-                    # satisfied; fall through to a normal scheduler start.
-                logging.info("Resume Safe Eyes after system wakeup")
-                self.plugins_manager.start()
-                next_break_time = -1
-                if self._suspend_next_break_delay is not None:
-                    next_break_time = round(datetime.datetime.now().timestamp()) + (
-                        self._suspend_next_break_delay
-                    )
-                self._suspend_next_break_delay = None
-                core.start(next_break_time)
-
-    def handle_suspend_signal(self, proxy, sender, signal, parameters):
-        if signal != "PrepareForSleep":
-            return
-
-        (sleeping,) = parameters
-
-        self.handle_suspend_callback(sleeping)
-
-    def handle_system_suspend(self):
-        """Setup system suspend listener."""
-        self.suspend_proxy = Gio.DBusProxy.new_for_bus_sync(
-            bus_type=Gio.BusType.SYSTEM,
-            flags=Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES,
-            info=None,
-            name="org.freedesktop.login1",
-            object_path="/org/freedesktop/login1",
-            interface_name="org.freedesktop.login1.Manager",
-            cancellable=None,
-        )
-        self.suspend_proxy.connect("g-signal", self.handle_suspend_signal)
-
     def on_skipped(self):
         """Listen to break screen Skip action and send the signal to core."""
         logging.info("User skipped the break")
@@ -682,47 +616,44 @@ class SafeEyes(Gtk.Application):
             self.safe_eyes_core.start()
             self.plugins_manager.start()
 
-    def enable_safeeyes(self, scheduled_next_break_time=-1):
-        """Listen to tray icon enable action and send the signal to core."""
+    def enable_safeeyes(self):
+        """Listen to tray icon enable action and send the signal to core.
+
+        VENDORED PATCH (ChickenBlocker): no scheduled_next_break_time
+        parameter. Preserved work-countdown delays are how a disabled period
+        used to be undone; with daemon-owned timing the daemon arms a FRESH
+        work interval when the pause ends, so enabling always starts the
+        (neutered) scheduler from scratch.
+        """
         if (
             not self.required_plugin_dialog_active
             and not self.active
             and self.safe_eyes_core.has_breaks()
         ):
             self.active = True
-            self.safe_eyes_core.start(scheduled_next_break_time)
+            self.safe_eyes_core.start()
             self.plugins_manager.start()
-        self._meeting_next_break_delay = None
-        self._meeting_pause_monotonic = None
 
     def pause_for_meeting(self):
-        """Disable while retaining enough state to undo an unconfirmed pause."""
+        """Disable SafeEyes for the duration of a calendar meeting.
+
+        VENDORED PATCH (ChickenBlocker): no work-countdown preservation. The
+        daemon (which owns all timing) disarms its work deadline for the
+        meeting and arms a FRESH interval when the pause ends.
+        """
         if not self.active:
             return
-        self._meeting_next_break_delay = None
-        if (
-            self.safe_eyes_core.context.state in (State.WAITING, State.PRE_BREAK)
-            and self.safe_eyes_core.scheduled_next_break_time is not None
-        ):
-            delay = (
-                self.safe_eyes_core.scheduled_next_break_time.timestamp()
-                - datetime.datetime.now().timestamp()
-            )
-            self._meeting_next_break_delay = max(1, round(delay))
-        self._meeting_pause_monotonic = time.monotonic()
         self.disable_safeeyes()
 
     def resume_meeting_after_suspend(self):
-        """Cancel an unconfirmed meeting pause as ordinary suspended work."""
-        delay = self._meeting_next_break_delay
-        paused_at = self._meeting_pause_monotonic
-        if delay is not None and paused_at is not None:
-            # monotonic() excludes Linux suspend time, so only awake time spent
-            # in the confirmation window is charged to the work interval.
-            delay = max(1, delay - round(time.monotonic() - paused_at))
-            self.enable_safeeyes(datetime.datetime.now().timestamp() + delay)
-        else:
-            self.enable_safeeyes()
+        """Cancel an unconfirmed meeting pause (plain re-enable).
+
+        VENDORED PATCH (ChickenBlocker): the machine suspended before the
+        camera confirmed the meeting; treat it as ordinary suspended time.
+        The daemon applies its own suspend rules to the work interval, so a
+        plain enable (neutered scheduler) is all that is needed here.
+        """
+        self.enable_safeeyes()
 
     def disable_safeeyes(self, status=None, is_resting=False):
         """Listen to tray icon disable action and send the signal to core."""
@@ -771,6 +702,59 @@ class SafeEyes(Gtk.Application):
         False if the core could not honour it right now (no scheduler wait
         armed yet) so the remote CLI caller can retry."""
         return self.safe_eyes_core.take_break(break_type)
+
+    def impose_break(
+        self, break_type: typing.Optional[BreakType], duration: int
+    ) -> bool:
+        """VENDORED PATCH (ChickenBlocker): show a break overlay of the given
+        type and duration NOW, on the daemon's authority. Covers both core
+        states the daemon can face:
+          * running (WAITING with an armed scheduler wait) -> core.impose_break
+            consumes the wait and dispatches to resume_break synchronously;
+          * stopped (Start-work gate holds, or a fresh launch mid-startup) ->
+            mark running and show the break directly via resume_break, since
+            there is no armed wait to consume.
+        Returns True if honoured (or a break is already up), False to retry.
+        """
+        core = self.safe_eyes_core
+        if core._taking_break is not None:
+            logging.info("Impose ignored; a break is already running")
+            return True
+        if not core.running:
+            logging.info(
+                "Impose on stopped core; starting core and showing break"
+            )
+            if not self.active:
+                self.active = True
+                self.plugins_manager.start()
+            core.running = True
+            core.resume_break(break_type, duration)
+            self._persist_imposed_break_name()
+            return True
+        honoured = core.impose_break(break_type, duration)
+        if honoured:
+            self._persist_imposed_break_name()
+        return honoured
+
+    def _persist_imposed_break_name(self):
+        # Write the imposed break's name into session.json under "break" so
+        # cb_break_check.py can classify the overlay as short vs long for
+        # external observers (the daemon knows the type it requested, but the
+        # session file is how everyone else tells them apart). The natural
+        # scheduler path writes this in update_next_break; the impose path
+        # bypasses it, so mirror it here. If the dispatch was deferred (hook
+        # in flight), _taking_break is still None and the next impose retry
+        # persists it instead.
+        core = self.safe_eyes_core
+        break_obj = core._taking_break
+        if break_obj is None:
+            return
+        try:
+            self.context["session"]["break"] = break_obj.name
+        except Exception:
+            return
+        if self.config.get("persist_state"):
+            utility.write_json(utility.SESSION_FILE_PATH, self.context["session"])
 
     def status(self):
         """Return the status of Safe Eyes."""

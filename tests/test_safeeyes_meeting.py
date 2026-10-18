@@ -1,7 +1,5 @@
-import datetime
 from pathlib import Path
 import sys
-import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -10,53 +8,45 @@ from unittest.mock import Mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor"))
 
-from safeeyes.model import State  # noqa: E402
 from safeeyes.safeeyes import SafeEyes  # noqa: E402
 
 
 class SafeEyesMeetingPauseTests(unittest.TestCase):
-    def test_pause_records_waiting_work_countdown(self):
+    """VENDORED CHANGE (ChickenBlocker): with daemon-owned break timing there
+    is NO work-countdown preservation across a meeting pause anymore. The
+    daemon disarms its own work deadline (se_work_end) while the pause holds
+    and arms a FRESH interval when it ends, so the plugin-side pause/resume
+    pair is now a plain disable/enable of the (neutered) scheduler."""
+
+    def test_pause_is_plain_disable(self):
         disable = Mock()
         fake = SimpleNamespace(
             active=True,
-            safe_eyes_core=SimpleNamespace(
-                context=SimpleNamespace(state=State.WAITING),
-                scheduled_next_break_time=datetime.datetime.now()
-                + datetime.timedelta(seconds=300),
-            ),
-            _meeting_next_break_delay=None,
-            _meeting_pause_monotonic=None,
             disable_safeeyes=disable,
         )
 
         SafeEyes.pause_for_meeting(fake)
 
-        self.assertGreaterEqual(fake._meeting_next_break_delay, 299)
-        self.assertLessEqual(fake._meeting_next_break_delay, 300)
-        self.assertIsNotNone(fake._meeting_pause_monotonic)
         disable.assert_called_once_with()
 
-    def test_suspend_resume_charges_only_awake_confirmation_time(self):
-        enable = Mock()
+    def test_pause_when_inactive_is_noop(self):
+        disable = Mock()
         fake = SimpleNamespace(
-            _meeting_next_break_delay=300,
-            _meeting_pause_monotonic=time.monotonic() - 30,
-            enable_safeeyes=enable,
+            active=False,
+            disable_safeeyes=disable,
         )
 
-        before = datetime.datetime.now().timestamp()
-        SafeEyes.resume_meeting_after_suspend(fake)
-        after = datetime.datetime.now().timestamp()
+        SafeEyes.pause_for_meeting(fake)
 
-        scheduled = enable.call_args.args[0]
-        self.assertGreaterEqual(scheduled, before + 269)
-        self.assertLessEqual(scheduled, after + 270)
+        disable.assert_not_called()
 
-    def test_break_pause_resumes_as_fresh_work_interval(self):
+    def test_suspend_resume_is_plain_enable_without_preserved_time(self):
+        # Regression: the old path scheduled enable_safeeyes(now + delay),
+        # which armed a natural break `delay` seconds later. With the
+        # neutered scheduler that must never happen: the resume is a plain
+        # enable with no scheduled time at all.
         enable = Mock()
         fake = SimpleNamespace(
-            _meeting_next_break_delay=None,
-            _meeting_pause_monotonic=time.monotonic(),
             enable_safeeyes=enable,
         )
 

@@ -398,82 +398,6 @@ else
   systemctl start ChickenBlocker.service
 fi
 
-# --- Force the night break immediately after an update -----------------------
-# `make update` refreshes safeeyes{,-night}.json. ChickenBlocker will detect the
-# src-hash drift on its next ~30s cycle and re-seed + force the break -- but
-# that quit+relaunch window (and the cycle delay) is a gap the user could use.
-# To close it, force the night break RIGHT NOW if we are in night hours: quit
-# safeeyes (so it reloads the just-refreshed config), relaunch, and send -t.
-# Runs as the real user (safeeyes is a per-user GApplication). Best-effort: if
-# it fails, ChickenBlocker's next cycle will catch up.
-hour="$(date +%H)"
-# Night = [00:00, 08:00). Start is FIXED at 00:00 — no date override.
-if [ "$hour" -lt 8 ]; then
-  echo
-  echo "=== Night mode: forcing SafeEyes break immediately ==="
-  SE_NIGHT_SRC="/opt/ChickenBlocker/safeeyes-night.json"
-  SE_LIVE="$REAL_HOME/.config/safeeyes/safeeyes.json"
-  if [ -f "$SE_NIGHT_SRC" ] && [ -n "$REAL_USER" ]; then
-    # Seed the live config + patch duration to seconds left until 08:00.
-    install -d -m0755 "$(dirname "$SE_LIVE")"
-    install -m0644 -o "$REAL_USER" "$SE_NIGHT_SRC" "$SE_LIVE"
-    secs_left=$(( 3600 * (8 - 10#$hour) - 10#$(date +%M) * 60 - 10#$(date +%S) ))
-    [ "$secs_left" -lt 0 ] && secs_left=$(( secs_left + 86400 ))
-    python3 -c "
-import json,sys
-p='$SE_LIVE'
-d=json.load(open(p))
-d['short_break_duration']=$secs_left
-json.dump(d,open(p,'w'),indent=4)
-" 2>/dev/null && echo "patched short_break_duration=$secs_left (to 08:00)"
-
-    # Quit + relaunch + force break as the user — only if we can reach the
-    # D-Bus session bus (requires running graphical login, not a TTY).
-    DBUS_SOCK="unix:path=/run/user/$(id -u "$REAL_USER")/bus"
-    if dbus-send --bus="$DBUS_SOCK" --print-reply \
-         --dest=org.freedesktop.DBus /org/freedesktop/DBus \
-         org.freedesktop.DBus.GetId >/dev/null 2>&1; then
-    sudo -u "$REAL_USER" \
-      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$REAL_USER")/bus" \
-      XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" \
-      DISPLAY=:0 \
-      PYTHONPATH=/opt/ChickenBlocker \
-      safeeyes -q 2>/dev/null || true
-    sleep 2
-    sudo -u "$REAL_USER" \
-      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$REAL_USER")/bus" \
-      XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" \
-      DISPLAY=:0 \
-      PYTHONPATH=/opt/ChickenBlocker \
-      safeeyes 2>/dev/null & disown
-    sleep 4
-    for i in 1 2 3 4; do
-      sudo -u "$REAL_USER" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$REAL_USER")/bus" \
-        XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" \
-        DISPLAY=:0 \
-        PYTHONPATH=/opt/ChickenBlocker \
-        safeeyes -t 2>/dev/null && break
-      sleep 1
-    done
-    echo "forced night break (safeeyes -t)"
-    # Leave a flag so ChickenBlocker's next cycle absorbs the new src-hash WITHOUT
-    # quit+relaunch (which would briefly lift the overlay). ChickenBlocker deletes
-    # this file after absorbing.
-    touch /var/lib/ChickenBlocker/se_forced_by_update
-    chmod 0644 /var/lib/ChickenBlocker/se_forced_by_update 2>/dev/null || true
-    else
-      echo "No graphical session bus reachable (TTY?)."
-      echo "Config seeded; ChickenBlocker will quit+relaunch safeeyes on its next cycle (~30s)."
-      # Do NOT set se_forced_by_update here: that flag tells ChickenBlocker to
-      # absorb the hash WITHOUT quit+relaunch (update.sh already did it). In
-      # the TTY case we did NOT relaunch, so we must let ChickenBlocker detect
-      # src-drift and do a normal quit+relaunch + force-break.
-    fi
-  fi
-fi
-
-echo
 echo "=== Deploying cb_startwork SafeEyes plugin -> ~/.config/safeeyes/plugins/ ==="
 SE_PLUGINS_DIR="$REAL_HOME/.config/safeeyes/plugins/cb_startwork"
 SE_PLUGIN_NEW=0
@@ -481,8 +405,8 @@ if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
   # Detect first-time deploy: if the plugin dir didn't exist before, we must
   # restart SafeEyes once so it loads the new plugin (plugins load at startup,
   # no live-reload). On subsequent updates the dir already exists, so we SKIP
-  # the restart -- preserving the in-progress 30-min work cycle (the daemon's
-  # day-drift-preserve also avoids a reset). One-time reset only.
+  # the restart -- the daemon owns the work-interval clock (SafeEyes is only
+  # an overlay renderer), so restarts never lose pomodoro progress anyway.
   if [ ! -d "$SE_PLUGINS_DIR" ]; then SE_PLUGIN_NEW=1; fi
   sudo -u "$REAL_USER" install -d -m0755 "$REAL_HOME/.config/safeeyes/plugins/cb_startwork"
   sudo -u "$REAL_USER" install -m0644 "$REPO_ROOT/cb_startwork/config.json" "$SE_PLUGINS_DIR/config.json"

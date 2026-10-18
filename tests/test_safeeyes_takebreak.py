@@ -25,6 +25,7 @@ def _core(state=State.WAITING, **over):
         _timeout_id=None,
         _firing_hook=False,
         _take_break_now=False,
+        _imposed=None,
     )
     base.update(over)
     fake = SimpleNamespace(**base)

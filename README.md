@@ -27,27 +27,57 @@ Optional hardening layers make it hard to disable:
 
 Part of this tool is based on [SafeEyes](https://slgobinath.github.io/SafeEyes/)
 (GPL-3, (C) Gobinath). ChickenBlocker does not use the distro package as-is:
-a modified copy is vendored under `vendor/safeeyes/` (every local change is
-marked inline with a `VENDORED PATCH (ChickenBlocker)` comment) and deployed to
-`/opt/ChickenBlocker/safeeyes/`, where `PYTHONPATH=/opt/ChickenBlocker`
+a **heavily patched** copy is vendored under `vendor/safeeyes/` (every local
+change is marked inline with a `VENDORED PATCH (ChickenBlocker)` comment) and
+deployed to `/opt/ChickenBlocker/safeeyes/`, where `PYTHONPATH=/opt/ChickenBlocker`
 shadows the apt package. The apt `safeeyes` package
 (`sudo apt install safeeyes`) still provides the launcher and system
 dependencies. The daemon enforces SafeEyes as a second blocking surface:
 
 - **Auto-start + keep-alive**: if SafeEyes isn't running, the daemon starts it
   as the logged-in user; if the user kills it, it respawns on the next check.
+- **Daemon-owned timing (SafeEyes is only an overlay renderer)**: the
+  ChickenBlocker daemon - not SafeEyes - tracks the pomodoro clock
+  (`se_work_end` / `se_cycle` in `/var/lib/ChickenBlocker/se_state`). The
+  seeded live config has its scheduler intervals patched to 7 days, so
+  SafeEyes can NEVER fire a natural break; every overlay is commanded by the
+  daemon via `safeeyes --impose-short SECS` / `--impose-long SECS`. This
+  survives daemon restarts, `make update` relaunches and SafeEyes being
+  killed without losing work-interval progress. The tray icon displays the
+  real schedule (daemon publishes `/tmp/cb_se_schedule` every cycle: next
+  break, next long break, cycle X/4); without the daemon it falls back to
+  SafeEyes' own (meaningless) computation after 5 minutes of staleness.
 - **DAY (08:00-23:59)**: a strict pomodoro schedule - 30 min work, 5 min break,
   30 min long break after 4 cycles. Breaks are un-skippable/un-postponable and
   the tray disable is off. Camera activity alone does not disable Safe Eyes.
   Only an eligible meeting from the dedicated calendar can open a pause.
-  Work countdowns pause during sleep and after 2 minutes away; break countdowns
-  use wall time, so sleeping or locking the screen does not pause a break.
+  A manual break (tray "Take a break now") counts as a taken break: it
+  advances the cycle (a long one ends the 4-cycle set), and a fresh work
+  interval starts after the Start-work gate - exactly like a scheduled one.
+- **Suspend semantics**:
+  - Sleeping mid-break consumes that break: on wake the daemon re-imposes
+    only the time left, or considers it fully served if the sleep outlasted
+    it (the overlay's own countdown is wall-clock based, so it also ends by
+    itself).
+  - Sleeping during a work interval does NOT count as work: the countdown is
+    PAUSED for the sleep (the deadline is pushed by the sleep duration, so
+    you still owe every minute that was left). But if the sleep was LONGER
+    than the time left to the end of the interval, the pending break is
+    IGNORED (skipped, cycle advances) and a fresh work interval starts on
+    wake - waking up never slams a break in your face.
+  - Sleeping behind the "Start work" gate: the gate survives; if it was held
+    (away/suspended) 30+ minutes, Start begins a fresh full interval.
 - **NIGHT (00:00-08:00)**: a single strict 8h break blanks the screen for the
-  whole night. Calendar events and camera activity are ignored at night.
+  whole night, imposed for exactly the seconds left until 08:00 and
+  re-imposed whenever the overlay is missing (killed overlay, resume,
+  relaunch). Calendar events and camera activity are ignored at night.
 
-Source configs are `safeeyes.json` (day) and `safeeyes-night.json` (night),
-seeded into `~/.config/safeeyes/safeeyes.json` and applied via a quit+relaunch
-at each 00:00 / 08:00 boundary. Camera detection uses `cb_av_check.py`
+Source configs are `safeeyes.json` (day) and `safeeyes-night.json` (night);
+their `short/long_break_interval` and `short/long_break_duration` values are
+the schedule the DAEMON reads and imposes (the intervals are only used to
+compute the scheme, never run by SafeEyes itself). Configs are seeded into
+`~/.config/safeeyes/safeeyes.json` (with neutered intervals) at each
+00:00 / 08:00 boundary or on edit. Camera detection uses `cb_av_check.py`
 (`/proc/*/fd` -> `/dev/video*`).
 
 Note: SafeEyes itself is not SIGKILL-immune in v1 (only `ChickenBlocker` is); it

@@ -48,7 +48,12 @@ class API:
         utility.execute_main_thread(self._application.show_about, activation_token)
 
     def enable_safeeyes(self, next_break_time=-1) -> None:
-        utility.execute_main_thread(self._application.enable_safeeyes, next_break_time)
+        # VENDORED PATCH (ChickenBlocker): next_break_time is ACCEPTED for
+        # plugin compatibility but IGNORED -- the ChickenBlocker daemon owns
+        # all break timing, so enabling always restarts the (neutered)
+        # scheduler fresh. Passing a scheduled time here must never arm a
+        # natural break.
+        utility.execute_main_thread(self._application.enable_safeeyes)
 
     def disable_safeeyes(self, status=None, is_resting=False) -> None:
         utility.execute_main_thread(

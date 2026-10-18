@@ -20,14 +20,12 @@
 #     running=False, so __start_next_break's `if self.running:` guard skips
 #     scheduling -> the next break is NOT queued -> work timer paused. We then
 #     show a fullscreen window.
-#   - After a completed break, the Start button calls core.start() and schedules
-#     a fresh work interval. For an idle gate, it instead restores the exact
-#     work time that remained when the user went away -- UNLESS the gate was
-#     held (user away / machine suspended) for idle_gate_reset_seconds or
-#     longer, in which case the saved remainder is stale (the user effectively
-#     rested) and Start begins a fresh full work interval. Without this, a
-#     suspend across the gate made the stale remainder fire a break within
-#     seconds/minutes of pressing Start after wake.
+#   - Start always calls core.start() FRESH. VENDORED CHANGE (ChickenBlocker):
+#     the daemon (ChickenBlocker) owns all work-interval timing -- when the
+#     sentinel flag clears, IT arms the next work deadline, applying its own
+#     held-too-long reset rule. The plugin no longer saves/restores any
+#     remaining work time (the scheduler it would restore into is neutered
+#     and must never fire on its own).
 #
 # Suspend detection:
 #   - on_countdown(countdown, seconds) fires every second during a break. We
@@ -84,6 +82,12 @@ button_label = "Start work"
 # Start to resume the next work interval. This brackets every work session
 # with a Start gate on both ends (break-over and away-too-long).
 #
+# Work-time bookkeeping across the gate is the DAEMON's job (it owns all
+# timing): while the sentinel flag exists it disarms its work deadline, and
+# when the flag clears it arms the next deadline (fresh, or the preserved
+# remainder if the gate was held only briefly). This plugin only stops the
+# (neutered) scheduler and shows the dialog.
+#
 # REQUIRES smartpause DISABLED in safeeyes.json: smartpause calls
 # disable_safeeyes() at idle_time (5s) -> core state RESTING, which fires
 # before this threshold and would prevent the gate from ever triggering; and
@@ -96,10 +100,6 @@ _idle_poll_seconds = 5
 _idle_monitor_thread = None
 _idle_monitor_stop = threading.Event()
 _idle_gated = False             # we triggered the idle gate; dialog is up
-_idle_next_break_delay = None   # active work seconds left when idle gate fired
-_idle_gate_reset_seconds = 1800  # gate held (away incl. suspend) >= this ->
-                                 # Start begins a fresh full work interval
-_idle_gate_fired_time = None    # wall-clock when the idle gate fired
 
 # PipeWire playback streams whose application/media name matches one of these
 # tokens count as "browser video playing" -> do NOT gate (the user is
@@ -129,7 +129,6 @@ def _log_decision(action, **kw):
 def init(ctx, safeeyes_config, plugin_config):
     global context, core, message, button_label
     global _idle_gate, _idle_gate_seconds, _idle_poll_seconds
-    global _idle_gate_reset_seconds
     context = ctx
     try:
         core = ctx.api._application.safe_eyes_core
@@ -141,27 +140,21 @@ def init(ctx, safeeyes_config, plugin_config):
     _idle_gate = bool(plugin_config.get("idle_gate", _idle_gate))
     _idle_gate_seconds = int(plugin_config.get("idle_gate_seconds", _idle_gate_seconds))
     _idle_poll_seconds = int(plugin_config.get("idle_poll_seconds", _idle_poll_seconds))
-    _idle_gate_reset_seconds = int(
-        plugin_config.get("idle_gate_reset_seconds", _idle_gate_reset_seconds)
-    )
     _log_decision("init", core=core is not None, msg=message[:30],
-                  idle_gate=_idle_gate, idle_secs=_idle_gate_seconds,
-                  idle_reset_secs=_idle_gate_reset_seconds)
+                  idle_gate=_idle_gate, idle_secs=_idle_gate_seconds)
     _last_countdown_reset()
     _setup_suspend_listener()
     _start_idle_monitor()
 
 
 def _setup_suspend_listener():
-    # SafeEyes' OWN logind PrepareForSleep handler (safeeyes.py:
-    # handle_suspend_callback) calls core.start() on resume. That overrides the
-    # core.stop() we issued to hold the Start-work gate: after suspend -> wake
-    # -> relogin the scheduler silently resumes and the user can work without
-    # pressing Start (and the X keyboard grab is dropped across the VT switch).
-    # We subscribe to the SAME signal and, on resume while our dialog is up,
-    # re-stop the core + re-grab the keyboard + re-raise the window so the gate
-    # is re-imposed. Runs the work on the GTK main thread (core/window/Xlib
-    # grab are all main-thread-affine).
+    # On resume while our Start-work dialog is up: re-raise the fullscreen
+    # window + re-assert the keep-above hint (the lock screen / other windows
+    # raised during suspend may have covered it). VENDORED NOTE
+    # (ChickenBlocker): SafeEyes' own logind resume handler (which used to
+    # core.start() behind the gate) is removed -- the daemon owns timing --
+    # so this is now purely cosmetic re-assertion. Runs on the GTK main
+    # thread (window/Xlib operations are main-thread-affine).
     try:
         proxy = Gio.DBusProxy.new_for_bus_sync(
             Gio.BusType.SYSTEM,
@@ -190,8 +183,9 @@ def _on_resume_while_gating():
     if _dialog is None:
         return False
     _log_decision("resume while dialog up; re-imposing gate")
-    # SafeEyes' resume handler just called core.start(); undo it so the
-    # scheduler stays paused until the user presses Start.
+    # Defense in depth: nothing should be running behind the gate, but if a
+    # stale scheduler ever restarts, stop it again so the gate holds until
+    # the user presses Start.
     if core is not None and getattr(core, "running", False):
         try:
             core.stop()
@@ -269,8 +263,8 @@ def _state_is_waiting():
 def _idle_tick():
     # Gate integrity guard: the ONLY legitimate state while our Start-work
     # dialog is up is core stopped. SafeEyes' OWN suspend resume handler
-    # (handle_suspend_callback) calls core.start() on wake regardless of our
-    # gate; if our _on_resume_while_gating re-stop lost the race (or was
+    # (now removed -- the daemon owns timing) restarted the core on wake
+    # regardless of our gate; if our _on_resume_while_gating re-stop lost the race (or was
     # missed entirely), the scheduler silently runs behind the dialog and
     # fires breaks under it -> endless break/gate loop. Re-assert the stop
     # from this 5s poll (marshalled to the GTK main thread).
@@ -367,25 +361,17 @@ def _do_idle_gate():
     # Runs on the GTK main thread (queued via GLib.idle_add). Mirrors the
     # natural-break-end path in on_stop_break: set the sentinel the daemon
     # respects, stop the scheduler so __start_next_break does not queue the
-    # next work interval, then show the same Start-work dialog.
-    global _idle_gated, _idle_next_break_delay, _idle_gate_fired_time
+    # next work interval, then show the same Start-work dialog. The DAEMON
+    # records the work time left (its own deadline) when it sees the sentinel
+    # and re-arms it when Start clears the flag.
+    global _idle_gated
     if _dialog is not None:
         _idle_gated = False
         return False
     if core is None:
         return False
-    _idle_next_break_delay = None
-    next_break = getattr(core, "scheduled_next_break_time", None)
-    if next_break is not None:
-        _idle_next_break_delay = max(
-            1, round(next_break.timestamp() - time.time())
-        )
-    _log_decision(
-        "idle_gate; pausing core + showing dialog",
-        remaining=_idle_next_break_delay,
-    )
+    _log_decision("idle_gate; pausing core + showing dialog")
     _idle_gated = True
-    _idle_gate_fired_time = time.time()
     _set_flag()
     try:
         core.stop()
@@ -751,31 +737,16 @@ def _show_dialog():
 
 
 def _on_start_clicked(_widget):
-    global _dialog, _idle_gated, _idle_next_break_delay, _idle_gate_fired_time
-    next_break_time = -1
-    held_for = None
-    if _idle_gated and _idle_next_break_delay is not None:
-        if _idle_gate_fired_time is not None:
-            held_for = max(0, round(time.time() - _idle_gate_fired_time))
-        if held_for is not None and held_for >= _idle_gate_reset_seconds:
-            # The gate was held (user away / machine suspended) for longer
-            # than idle_gate_reset_seconds: the saved remainder is stale --
-            # the user effectively rested -- so begin a fresh full work
-            # interval instead of firing a break moments after Start.
-            _log_decision("  gate held past reset; dropping stale remainder",
-                          held_s=held_for, reset_s=_idle_gate_reset_seconds)
-            _idle_next_break_delay = None
-        else:
-            next_break_time = round(time.time()) + _idle_next_break_delay
-    _log_decision(
-        "start_pressed; resuming core",
-        remaining=_idle_next_break_delay if _idle_gated else None,
-        held_s=held_for if _idle_gated else None,
-    )
+    global _dialog, _idle_gated
+    # VENDORED CHANGE (ChickenBlocker): always a FRESH core.start(). The
+    # daemon owns work-interval timing: when _clear_flag() removes the
+    # sentinel, its next cycle arms the work deadline (fresh, or the preserved
+    # remainder if the gate was held only briefly). No remainder is restored
+    # here -- the scheduler being restarted is neutered and must never fire a
+    # natural break.
+    _log_decision("start_pressed; resuming core")
     _clear_flag()
     _idle_gated = False
-    _idle_next_break_delay = None
-    _idle_gate_fired_time = None
     if _dialog is not None:
         d = _dialog
         _dialog = None
@@ -788,15 +759,9 @@ def _on_start_clicked(_widget):
             pass
     if core is not None and not core.running:
         try:
-            core.start(next_break_time)
+            core.start()
         except Exception as e:
             _log_decision("  core.start failed", error=str(e))
-    elif core is not None and core.running:
-        # The core was already running when Start was pressed: SafeEyes'
-        # suspend resume handler restarted it behind the gate and our guards
-        # have not re-stopped it yet (or the user pressed Start first). Log
-        # it; the countdown continues from wherever the resume put it.
-        _log_decision("  core already running at Start press (resume leak)")
 
 
 def on_exit():

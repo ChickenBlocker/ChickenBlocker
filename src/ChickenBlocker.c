@@ -532,16 +532,27 @@ static void enforce_vivaldi_managed_profile(struct passwd *pw, int dry) {
 // SafeEyes (apt: safeeyes, comm "safeeyes") is enforced as a second layer:
 //   * auto-started and kept alive (respawned within ~30s if killed)
 //   * DAY (08:00-23:59): a strict pomodoro schedule (30 work / 5 break, long
-//     30-min break after 4 cycles). Breaks are un-skippable/un-postponable;
-//     the ONLY escape is an active camera/mic call, which disables SafeEyes
-//     for the call's duration (then the schedule resumes).
+//     30-min break after 4 cycles), timed ENTIRELY BY THE DAEMON (SafeEyes
+//     only renders overlays we impose; its own scheduler is neutered).
+//     Breaks are un-skippable/un-postponable; the ONLY escape is an active
+//     camera/mic call, which disables SafeEyes for the call's duration (then
+//     a fresh work interval starts). Suspend is NOT work time: mid-break it
+//     consumes the break; during work it PAUSES the countdown -- and a sleep
+//     LONGER than the time left to the interval's end SKIPS the pending
+//     break entirely.
 //   * NIGHT (00:00-08:00): a single strict 8h break that blanks the screen
-//     for the whole night. AV check is SKIPPED at night - no call lifts it.
+//     for the whole night, imposed for exactly the seconds left to 08:00 and
+//     re-imposed whenever the overlay is missing. AV check is SKIPPED at
+//     night - no call lifts it.
 //
 // The active config variant is seeded into ~/.config/safeeyes/safeeyes.json
-// (as the user) only at a mode boundary or on drift, then SafeEyes is quit
-// and relaunched so it reloads (no live-reload). State (current mode +
-// whether we paused it for a call) persists in /var/lib/ChickenBlocker/se_state.
+// (as the user) only at a mode boundary or on drift (with its scheduler
+// intervals neutered, see SE_NEUTERED_INTERVAL), then SafeEyes is quit and
+// relaunched so it reloads (no live-reload). The pomodoro CLOCK itself is
+// owned by the daemon (se_work_end / se_cycle below), not by SafeEyes; the
+// vendored copy is a heavily patched overlay renderer. State (current mode,
+// work deadline, cycle count, whether we paused it for a call) persists in
+// /var/lib/ChickenBlocker/se_state.
 
 #define SE_STATE_FILE    "/var/lib/ChickenBlocker/se_state"
 #define SE_BIN           "/usr/bin/safeeyes"
@@ -572,6 +583,15 @@ static void enforce_vivaldi_managed_profile(struct passwd *pw, int dry) {
 _Static_assert(NIGHT_START_HOUR == 0, "night must always start at 00:00");
 #define RESUME_THRESHOLD     30   // fallback wall-clock gap treated as suspend
 #define SE_FORCED_FLAG   "/var/lib/ChickenBlocker/se_forced_by_update"
+// Scheduler neutering: the seeded live config gets these (minute) intervals so
+// SafeEyes' built-in scheduler can NEVER fire a natural break. The daemon owns
+// all timing and imposes overlays explicitly (--impose-short/-long SECS).
+#define SE_NEUTERED_INTERVAL 10080   // minutes = 7 days
+// Start-work gate hold reset: if the gate (user away / machine suspended) was
+// held at least this long, pressing Start begins a FRESH work interval instead
+// of restoring the pre-gate remainder (the user effectively rested). Mirrors
+// the old cb_startwork idle_gate_reset_seconds.
+#define SE_GATE_RESET_SECS 1800LL
 // Sentinel written by the cb_startwork plugin while its "Start work" dialog is
 // showing (core.stop() was called, scheduler paused). The daemon must NOT
 // quit+relaunch SafeEyes while this exists -- doing so kills the process
@@ -583,11 +603,12 @@ struct SafeEyesState {
 	int se_strict;        // -1 unknown, 0 day, 1 night (mode currently seeded)
 	int se_paused_by_us;  // 0/1: we disabled SE for a call (only day)
 	int se_break_active;  // 0/1: a SafeEyes break overlay was up at the last
-	                      // cycle. Used on day-resume to re-impose a break if
-	                      // the machine was suspended mid-break (SafeEyes'
-	                      // own PrepareForSleep handler abandons an in-progress
-	                      // break and reschedules the NEXT one ~30min out, so
-	                      // without this closing the lid mid-break escapes it).
+	                      // cycle. Used on day-resume to re-impose the time
+	                      // LEFT if the machine was suspended mid-break (the
+	                      // sleep counts toward the break; without this,
+	                      // closing the lid mid-break could escape it since
+	                      // the daemon-imposed overlay's frozen countdown
+	                      // only self-heals once the machine is awake).
 	int se_break_type;    // -1 unknown, 0 short, 1 long: type of the break that
 	                      // was in progress, so on resume we know the ORIGINAL
 	                      // duration (short 5min / long 30min) to compute the
@@ -595,13 +616,24 @@ struct SafeEyesState {
 	time_t se_break_start; // wall-clock when the current break was first
 	                       // detected (cycle granularity, ~30s). On resume:
 	                       // elapsed = suspend_time - se_break_start.
-	int se_need_restore;  // 0/1: we patched the live day config's break
-	                      // duration to a time-left value and relaunched, so
-	                      // the running instance now serves SHORT breaks of that
-	                      // shortened duration. Once that re-imposed break ends
-	                      // we must re-copy the real day config + relaunch to
-	                      // restore the normal 5/30min durations before the
-	                      // next natural break fires with the wrong duration.
+	time_t se_work_end;   // DAEMON-OWNED pomodoro clock: wall-clock deadline
+	                      // of the current WORK interval (0 = disarmed: a
+	                      // break/gate/meeting holds it). SafeEyes' own
+	                      // scheduler is neutered (huge intervals) and only
+	                      // shows overlays the daemon imposes via
+	                      // `safeeyes --impose-short/-long <secs>`.
+	int se_cycle;         // 0..3: work cycles completed since the last LONG
+	                      // break. The next imposed break is LONG iff
+	                      // se_cycle == 3 (the 4th); incremented when a break
+	                      // completes OR is skipped/satisfied by sleep.
+	time_t se_gate_start; // wall-clock when the cb_startwork "Start work"
+	                      // gate flag was first seen for the current gate
+	                      // (0 = no gate pending).
+	long long se_work_left_at_gate; // work seconds remaining when an idle
+	                      // gate froze the deadline (-1 = gate began at a
+	                      // break end -> fresh interval on Start). If the
+	                      // gate was held >= SE_GATE_RESET_SECS (away or
+	                      // suspended), Start arms a FRESH interval.
 	time_t se_last_cycle; // wall-clock of the previous cycle (resume detection)
 	int se_boot_mono_valid; // 0/1: se_boot_mono has been sampled. The valid
 	                        // cumulative-suspend value is 0 before first sleep.
@@ -613,6 +645,13 @@ struct SafeEyesState {
 	                      // completed post-resume (which masks the wall-clock gap
 	                      // because se_last_cycle gets rewritten at resume time).
 	unsigned long se_src_hash; // djb2 hash of the source config last seeded
+	int se_neutered;       // 0/1: the LIVE config was seeded with neutered
+	                       // scheduler intervals (SE_NEUTERED_INTERVAL). A
+	                       // state file from an older daemon lacks this (0),
+	                       // forcing one re-seed on upgrade so a stale
+	                       // un-neutered live config (e.g. the old night
+	                       // config's 1-min interval) can never fire a
+	                       // natural break.
 	char se_cal_hour[16]; // last attempted local calendar hour (YYYY-MM-DDTHH)
 	int se_meeting_phase; // 0 idle, 1 waiting for camera, 2 camera confirmed
 	char se_meeting_id[65];
@@ -782,6 +821,44 @@ static void safeeyes_quit(struct passwd *pw, int dry) {
 		printf("SAFEEYES: -q didn't exit; SIGTERM\n");
 		term_and_wait("safeeyes", 5);
 	}
+}
+
+// Impose a break overlay of the given type and duration via the vendored
+// SafeEyes CLI (--impose-short/-long SECS). The daemon owns ALL break timing;
+// SafeEyes' own scheduler is neutered and only renders overlays on command.
+// Retries across ~24s: right after a (re)launch the GApplication may not have
+// its scheduler wait armed yet, so the CLI exits non-zero until ready.
+// Returns 0 if the impose was honoured (or a break was already up), -1 if not.
+static int safeeyes_impose(struct passwd *pw, int dry, int is_long, long long secs) {
+	if (dry) {
+		printf("SAFEEYES: would impose %s break (%llds)\n",
+			is_long ? "long" : "short", secs);
+		return 0;
+	}
+	// Wait for SafeEyes to be running (after a relaunch).
+	for (int i = 0; i < 8 * 4 && !safeeyes_running(); i++) usleep(250 * 1000);
+	if (!safeeyes_running()) {
+		printf("SAFEEYES: impose failed; safeeyes not running\n");
+		return -1;
+	}
+	char secs_str[24];
+	snprintf(secs_str, sizeof secs_str, "%lld", secs);
+	for (int i = 0; i < 10 && safeeyes_running(); i++) {
+		char *argv[] = {
+			(char *)SE_BIN,
+			is_long ? (char *)"--impose-long" : (char *)"--impose-short",
+			secs_str,
+			NULL
+		};
+		if (i == 0)
+			printf("SAFEEYES: imposing %s break (%llds)\n",
+				is_long ? "long" : "short", secs);
+		if (exec_as_user(pw, SE_BIN, argv, 8) == 0)
+			return 0;
+		usleep(2000 * 1000);
+	}
+	printf("SAFEEYES: impose not accepted\n");
+	return -1;
 }
 
 // Copy src to dst and chown to the user (so ~/.config/safeeyes/safeeyes.json
@@ -974,11 +1051,15 @@ static int se_read_state(struct SafeEyesState *st) {
 	st->se_break_active = 0;
 	st->se_break_type = -1;
 	st->se_break_start = 0;
-	st->se_need_restore = 0;
+	st->se_work_end = 0;
+	st->se_cycle = 0;
+	st->se_gate_start = 0;
+	st->se_work_left_at_gate = -1;
 	st->se_last_cycle = 0;
 	st->se_boot_mono_valid = 0;
 	st->se_boot_mono = 0;
 	st->se_src_hash = 0;
+	st->se_neutered = 0;
 	st->se_cal_hour[0] = 0;
 	st->se_meeting_phase = 0;
 	st->se_meeting_id[0] = 0;
@@ -999,11 +1080,15 @@ static int se_read_state(struct SafeEyesState *st) {
 		else if (!strcmp(line, "se_break_active")) st->se_break_active = atoi(v);
 		else if (!strcmp(line, "se_break_type")) st->se_break_type = atoi(v);
 		else if (!strcmp(line, "se_break_start")) st->se_break_start = (time_t)atoll(v);
-		else if (!strcmp(line, "se_need_restore")) st->se_need_restore = atoi(v);
+		else if (!strcmp(line, "se_work_end")) st->se_work_end = (time_t)atoll(v);
+		else if (!strcmp(line, "se_cycle")) st->se_cycle = atoi(v) & 3;
+		else if (!strcmp(line, "se_gate_start")) st->se_gate_start = (time_t)atoll(v);
+		else if (!strcmp(line, "se_work_left_at_gate")) st->se_work_left_at_gate = atoll(v);
 		else if (!strcmp(line, "se_last_cycle")) st->se_last_cycle = (time_t)atoll(v);
 		else if (!strcmp(line, "se_boot_mono_valid")) st->se_boot_mono_valid = atoi(v);
 		else if (!strcmp(line, "se_boot_mono")) st->se_boot_mono = (time_t)atoll(v);
 		else if (!strcmp(line, "se_src_hash")) st->se_src_hash = strtoul(v, NULL, 10);
+		else if (!strcmp(line, "se_neutered")) st->se_neutered = atoi(v);
 		else if (!strcmp(line, "se_cal_hour")) snprintf(st->se_cal_hour, sizeof st->se_cal_hour, "%s", v);
 		else if (!strcmp(line, "se_meeting_phase")) st->se_meeting_phase = atoi(v);
 		else if (!strcmp(line, "se_meeting_id")) snprintf(st->se_meeting_id, sizeof st->se_meeting_id, "%s", v);
@@ -1026,11 +1111,15 @@ static void se_write_state(const struct SafeEyesState *st) {
 	fprintf(f, "se_break_active=%d\n", st->se_break_active);
 	fprintf(f, "se_break_type=%d\n", st->se_break_type);
 	fprintf(f, "se_break_start=%lld\n", (long long)st->se_break_start);
-	fprintf(f, "se_need_restore=%d\n", st->se_need_restore);
+	fprintf(f, "se_work_end=%lld\n", (long long)st->se_work_end);
+	fprintf(f, "se_cycle=%d\n", st->se_cycle);
+	fprintf(f, "se_gate_start=%lld\n", (long long)st->se_gate_start);
+	fprintf(f, "se_work_left_at_gate=%lld\n", st->se_work_left_at_gate);
 	fprintf(f, "se_last_cycle=%lld\n", (long long)st->se_last_cycle);
 	fprintf(f, "se_boot_mono_valid=%d\n", st->se_boot_mono_valid);
 	fprintf(f, "se_boot_mono=%lld\n", (long long)st->se_boot_mono);
 	fprintf(f, "se_src_hash=%lu\n", st->se_src_hash);
+	fprintf(f, "se_neutered=%d\n", st->se_neutered);
 	fprintf(f, "se_cal_hour=%s\n", st->se_cal_hour);
 	fprintf(f, "se_meeting_phase=%d\n", st->se_meeting_phase);
 	fprintf(f, "se_meeting_id=%s\n", st->se_meeting_id);
@@ -1349,6 +1438,92 @@ static long long secs_until_morning(time_t now) {
 	return (long long)(m - now);
 }
 
+// Adjust a WORK deadline after a resume from suspend. Suspend time is NOT
+// work time: a sleep SHORTER than the work time that was left when the
+// machine went down just PAUSES the countdown (deadline pushed by the sleep
+// duration -- the user still owes every remaining minute). A sleep LONGER
+// than the time left means the user rested more than the pending break was
+// worth: the break is skipped (cycle advances, *skip set) and a fresh
+// interval starts at wake. `now` is the wake-side cycle time; the sleep
+// start is approximated as now - slept (cycle granularity, ~30s).
+static time_t se_work_resume_adjust(time_t work_end, time_t now,
+		long long slept, long long work_interval, int *skip) {
+	time_t sleep_start = now - (time_t)slept;
+	long long left_at_sleep = (long long)(work_end - sleep_start);
+	if (slept >= left_at_sleep) {
+		*skip = 1;
+		return now + (time_t)work_interval;
+	}
+	*skip = 0;
+	return work_end + (time_t)slept;
+}
+
+// Advance the pomodoro cycle counter after a COMPLETED break. A LONG break
+// ends the 4-cycle set (the count restarts); a SHORT one moves to the next
+// cycle. Manual breaks (tray "Take a break now") count exactly like
+// daemon-imposed ones.
+static int se_cycle_after_break(int cycle, int was_long) {
+	if (was_long) return 0;
+	return (cycle + 1) & 3;
+}
+
+// Publish the REAL (daemon-owned) schedule for display: the vendored
+// SafeEyes tray icon reads this file each refresh and shows it
+// instead of its own (neutered, meaningless) scheduler times. Refreshed
+// every cycle; the tray treats it as stale after 5 minutes without an
+// update. next_break <= 0 means "not scheduled yet" (Start-work gate,
+// disarmed); interval 0 hides the X/4 line (night).
+// (Overridable so the test harness can publish to a scratch path.)
+#ifndef SE_SCHEDULE_FILE
+#define SE_SCHEDULE_FILE "/tmp/cb_se_schedule"
+#endif
+static void se_write_schedule(const struct SafeEyesState *st,
+		int want_strict, time_t now) {
+	long long next_brk = 0, next_long = 0;
+	int interval = (st->se_cycle & 3) + 1;
+	long long work_interval =
+		get_json_int("safeeyes.json", "short_break_interval", 30) * 60;
+	long long short_dur =
+		get_json_int("safeeyes.json", "short_break_duration", 300);
+	long long long_dur =
+		get_json_int("safeeyes.json", "long_break_duration", 1800);
+	int c = st->se_cycle & 3;
+
+	if (want_strict) {
+		next_brk = next_long = (long long)now + secs_until_morning(now);
+		interval = 0;
+	} else if (st->se_break_active) {
+		// A break is up: the next break comes one work interval after this
+		// one ends (the Start-work gate makes it later; label-grade truth).
+		long long orig = st->se_break_type == 1 ? long_dur : short_dur;
+		long long end = st->se_break_start > 0
+			? (long long)st->se_break_start + orig
+			: (long long)now + orig;
+		if (end < now) end = now;
+		next_brk = end + work_interval;
+		next_long = (c == 3)
+			? end + 4 * work_interval           // the long one is running
+			: next_brk + (3 - c) * (work_interval + short_dur);
+	} else if (st->se_work_end > 0) {
+		next_brk = (long long)st->se_work_end;
+		next_long = (c == 3)
+			? next_brk                          // the next break IS the long one
+			: next_brk + (3 - c) * (work_interval + short_dur);
+	}
+	// else: gate/disarmed -> next_break 0 (tray shows "waiting"), interval
+	// still shows where we are in the 4-cycle set.
+
+	FILE *f = fopen(SE_SCHEDULE_FILE, "w");
+	if (!f) return;
+	fprintf(f, "night=%d\n", want_strict ? 1 : 0);
+	fprintf(f, "next_break=%lld\n", next_brk);
+	fprintf(f, "next_long=%lld\n", next_long);
+	fprintf(f, "interval=%d\n", interval);
+	fprintf(f, "total=4\n");
+	fclose(f);
+	chmod(SE_SCHEDULE_FILE, 0644);
+}
+
 // Night block window: [00:00, 08:00). The start is pinned to midnight by
 // NIGHT_START_HOUR (and a _Static_assert) — there is no date/hour override,
 // so night mode can never be pushed later. It always begins at 00:00.
@@ -1646,24 +1821,118 @@ static void safeeyes_run(struct passwd *pw, int dry, struct SafeEyesState *st) {
 	char se_dst[1100];
 	snprintf(se_dst, sizeof se_dst, "%s/.config/safeeyes/safeeyes.json", pw->pw_dir);
 
-	// If the cb_startwork plugin is showing its "Start work" dialog, leave the
-	// SafeEyes process and scheduler alone. The plugin called core.stop() and any
-	// quit/relaunch/-d/-e here would kill the process holding the dialog or
-	// disrupt its paused state. The independent hourly calendar sync and
-	// keep-alive still run; other SafeEyes enforcement and break tracking wait
-	// until Start removes the sentinel and resumes the scheduler.
+	// DAEMON-OWNED TIMING: SafeEyes is a dumb overlay renderer here. Its own
+	// scheduler is neutered (intervals patched to SE_NEUTERED_INTERVAL at
+	// seed time below), so it NEVER fires a natural break; overlays appear
+	// only via `safeeyes --impose-short/-long SECS` from this function. The
+	// pomodoro clock lives in se_state (se_work_end / se_cycle) and survives
+	// daemon restarts, `make update` relaunches, and SafeEyes being killed.
+
+	// --- Resume detection (BEFORE the Start-work gate early-return) --------
+	//
+	// (1) boottime-monotonic delta (PRIMARY): CLOCK_BOOTTIME advances during
+	//     suspend, CLOCK_MONOTONIC does not, so their difference = cumulative
+	//     seconds suspended since boot. An increase since last cycle means a
+	//     suspend happened. This is robust against the kernel freezer: when
+	//     the cycle is frozen mid-run and completes post-resume, the
+	//     wall-clock se_last_cycle gets rewritten at resume time (masking the
+	//     gap below), but the boot-mono delta still reveals the suspend.
+	//     Sampling must also run while the Start-work gate holds (its branch
+	//     returns early): a suspend across the gate must be absorbed here, or
+	//     the first cycle after Start would re-detect the same suspend and
+	//     misapply the skip rule to the just-armed work interval.
+	//
+	// (2) wall-clock gap (FALLBACK): used only when the boottime signal is
+	//     unavailable or reset by a reboot.
+	int resumed = 0;
+	long long slept = 0;   // seconds spent suspended since the last cycle
+	time_t bm = 0;
+	int bm_available = (bootmono_now(&bm) == 0);
+	time_t prev_bm = st->se_boot_mono;
+	int prev_bm_valid = st->se_boot_mono_valid;
+	long long suspend_secs = bm_available
+		? (long long)(bm - prev_bm) : 0;
+	if (bm_available && prev_bm_valid && suspend_secs > 2) {
+		resumed = 1;
+		slept = suspend_secs;
+		printf("SAFEEYES: resume detected (suspend %llds)\n", suspend_secs);
+	}
+	// Persist the new cumulative suspend counter NOW. The end-of-cycle state
+	// write re-reads state from disk (a separate local), so an in-memory-only
+	// update here would be lost -- and if a suspend happened, NOT persisting
+	// would leave the old (pre-suspend) counter on disk, causing the NEXT
+	// cycle to re-detect the same suspend forever. Persist validity
+	// separately: zero is the real cumulative-suspend value before the first
+	// sleep and must not be confused with an uninitialized sample.
+	if (bm_available) {
+		st->se_boot_mono = bm;
+		st->se_boot_mono_valid = 1;
+		if (!dry && (!prev_bm_valid || bm != prev_bm)) se_write_state(st);
+	}
+	int rt_fallback = (!bm_available
+		|| (prev_bm_valid && bm_available && bm < prev_bm));
+	if (!resumed && rt_fallback && st->se_last_cycle != 0) {
+		long long rtgap = (long long)(now - st->se_last_cycle);
+		if (rtgap > RESUME_THRESHOLD) {
+			resumed = 1;
+			slept = rtgap;
+			printf("SAFEEYES: resume detected (rt gap %llds)\n", rtgap);
+		}
+	}
+
+	// --- Start-work gate ----------------------------------------------------
+	// If the cb_startwork plugin is showing its "Start work" dialog, leave
+	// the SafeEyes process alone (any quit/relaunch/impose here would kill
+	// the process holding the dialog or fight its paused core). The daemon
+	// instead FREEZES its work deadline: an idle gate that fired mid-work
+	// preserves the remainder; a gate after a break ends starts fresh. On
+	// Start (flag clears) the deadline is re-armed below. The independent
+	// hourly calendar sync and keep-alive still run.
 	int startwork_dialog_up = (access(SE_STARTWORK_FLAG, F_OK) == 0);
 	if (startwork_dialog_up) {
-		printf("SAFEEYES: cb_startwork dialog up; skipping SafeEyes enforcement\n");
+		printf("SAFEEYES: cb_startwork dialog up; freezing work clock\n");
+		if (!dry && st->se_work_end > 0) {
+			// Idle gate mid-work: remember how much work time was left.
+			st->se_work_left_at_gate = (long long)(st->se_work_end - now);
+			if (st->se_work_left_at_gate < 0) st->se_work_left_at_gate = 0;
+			st->se_work_end = 0;
+			printf("SAFEEYES: gate froze work clock (%llds left)\n",
+				st->se_work_left_at_gate);
+		}
+		if (!dry && st->se_gate_start == 0) {
+			st->se_gate_start = now;
+			se_write_state(st);
+		}
 		struct MeetingLedger ledger;
 		meeting_ledger_read(&ledger);
 		calendar_schedule_run(pw, dry, st, &ledger);
-		if (!dry) se_write_state(st);
+		if (!dry) {
+			se_write_state(st);
+			se_write_schedule(st, want_strict, now);
+		}
 		if (!safeeyes_running()) {
 			printf("SAFEEYES: not running; launching\n");
 			if (!dry) launch_safeeyes(pw);
 		}
 		return;
+	}
+	// The gate just released (Start pressed): re-arm the work deadline.
+	if (st->se_gate_start > 0) {
+		long long held = (long long)(now - st->se_gate_start);
+		int fresh = (st->se_work_left_at_gate < 0
+			|| held >= SE_GATE_RESET_SECS);
+		long long gate_interval =
+			get_json_int("safeeyes.json", "short_break_interval", 30) * 60;
+		printf("SAFEEYES: start-work gate released after %llds; arming %s "
+			"work interval (%llds)\n", held, fresh ? "fresh" : "remaining",
+			fresh ? gate_interval : st->se_work_left_at_gate);
+		if (!dry) {
+			st->se_work_end = now + (fresh
+				? gate_interval : st->se_work_left_at_gate);
+			st->se_gate_start = 0;
+			st->se_work_left_at_gate = -1;
+			se_write_state(st);
+		}
 	}
 
 	// Ensure the config dir exists (user-owned).
@@ -1689,93 +1958,36 @@ static void safeeyes_run(struct passwd *pw, int dry, struct SafeEyesState *st) {
 		}
 	}
 
-	// Resume detection. Two independent signals:
-	//
-	//  (1) boottime-monotonic delta (PRIMARY): CLOCK_BOOTTIME advances during
-	//      suspend, CLOCK_MONOTONIC does not, so their difference = cumulative
-	//      seconds suspended since boot. An increase since last cycle means a
-	//      suspend happened. This is robust against the kernel freezer: when the
-	//      cycle is frozen mid-run and completes post-resume, the wall-clock
-	//      se_last_cycle gets rewritten to resume time (masking the gap below),
-	//      but the boot-mono delta still reveals the suspend.
-	//
-	//  (2) wall-clock gap (FALLBACK): used only when the boottime signal is
-	//      unavailable or reset by a reboot. It must not run when boottime is
-	//      valid because ordinary enforcement work can create a long wall gap.
-	//
-	// At night this matters: SafeEyes froze, and on resume its timer-based 8h
-	// break no longer lines up with 08:00. We reseed the duration to the time
-	// REMAINING to morning and force the overlay up immediately so the user
-	// cannot use the post-resume gap.
-	int resumed = 0;
-	time_t bm = 0;
-	int bm_available = (bootmono_now(&bm) == 0);
-	time_t prev_bm = st->se_boot_mono;
-	int prev_bm_valid = st->se_boot_mono_valid;
-	long long suspend_secs = bm_available
-		? (long long)(bm - prev_bm) : 0;
-	if (bm_available && prev_bm_valid && suspend_secs > 2) {
-		resumed = 1;
-		printf("SAFEEYES: resume detected (suspend %llds)\n", suspend_secs);
-	}
-	// Persist the new cumulative suspend counter NOW. The end-of-cycle state
-	// write re-reads state from disk (a separate local), so an in-memory-only
-	// update here would be lost -- and if a suspend happened, NOT persisting
-	// would leave the old (pre-suspend) counter on disk, causing the NEXT cycle
-	// to re-detect the same suspend forever (no branch below writes state on a
-	// day-resume with no break active + short suspend). Persist validity
-	// separately: zero is the real cumulative-suspend value before the first
-	// sleep and must not be confused with an uninitialized sample.
-	if (bm_available) {
-		st->se_boot_mono = bm;
-		st->se_boot_mono_valid = 1;
-		if (!prev_bm_valid || bm != prev_bm) se_write_state(st);
-	}
-	int rt_fallback = (!bm_available
-		|| (prev_bm_valid && bm_available && bm < prev_bm));
-	if (!resumed && rt_fallback && st->se_last_cycle != 0) {
-		long long rtgap = (long long)(now - st->se_last_cycle);
-		if (rtgap > RESUME_THRESHOLD) {
-			resumed = 1;
-			printf("SAFEEYES: resume detected (rt gap %llds)\n", rtgap);
-		}
-	}
+	// Scheme constants from the SOURCE day config (edit safeeyes.json to
+	// change the schedule; applies within ~30s).
+	long long work_interval =
+		get_json_int("safeeyes.json", "short_break_interval", 30) * 60;
+	long long short_dur =
+		get_json_int("safeeyes.json", "short_break_duration", 300);
+	long long long_dur =
+		get_json_int("safeeyes.json", "long_break_duration", 1800);
 
-	// (Re)seed the config at a mode boundary, on first run, on a night
-	// resume, or when the SOURCE config changed since the last seed (so an
-	// edited safeeyes{,-night}.json applies within ~30s, not at the next
-	// 00:00/08:00 boundary). For night, patch short_break_duration to the
-	// seconds left until 08:00 so the block always ends at morning regardless
-	// of when it started (mid-night boot, suspend resume, etc.) -- never a
-	// flat 480 min.
-	//
-	// RESUME is special: SafeEyes is still running and handles suspend/resume
-	// itself (via logind PrepareForSleep). On resume it calls start() which
-	// sets state=WAITING then waits short_break_interval (1 min) before the
-	// break. We must NOT quit+relaunch (that loses the running instance's
-	// resume handling and races the GApplication re-init). Instead: just patch
-	// the live config (for the NEXT launch's duration) and send -t to override
-	// the 1-min wait. SafeEyes' resume handler needs a moment to set WAITING,
-	// so retry -t across the remaining cycle budget.
+	// (Re)seed the config at a mode boundary, on first run, or when the
+	// SOURCE config changed. The live config's intervals are patched to
+	// SE_NEUTERED_INTERVAL so SafeEyes' built-in scheduler can never fire a
+	// natural break -- every overlay is imposed by the daemon with an exact
+	// duration, so no quit+relaunch dance is needed to apply one and no
+	// relaunch can lose work-interval progress (the clock is ours).
 	unsigned long src_hash = hash_file(desired_src);
 	int src_drift = (src_hash != 0 && src_hash != st->se_src_hash);
 	int boundary = (want_strict != st->se_strict);
-	int need_force_break = 0;
-	const char *force_arg = "-t";  // -t = take next break (night); -b = force a
-	                               // SHORT break (day time-left re-impose, whose
-	                               // duration we patched into short_break_duration)
-	int just_imposed_break = 0;  // we sent -t/-b this cycle; skip re-detection so
-	                             // a not-yet-rendered overlay doesn't get
-	                             // recorded as 0 (which would let a suspend in
-	                             // the next ~30s escape the just-imposed break)
+	int relaunched = 0;    // we quit+relaunched SafeEyes this cycle
+	int just_imposed = 0;  // we imposed an overlay this cycle; skip re-polling
+	                       // so a not-yet-rendered overlay isn't misread
 
-	// update.sh may have already seeded the config + forced the break directly
-	// (to avoid the quit+relaunch gap during `make update`). If it left the
-	// forced-flag, just absorb the new src_hash WITHOUT quit+relaunch, so we
-	// don't redundantly interrupt a break that's already active.
+	// update.sh may have quit SafeEyes itself (to load a redeployed vendored
+	// package). There is nothing to absorb beyond the hash anymore -- the
+	// daemon imposes whatever overlay is missing on its next action below --
+	// but keep the flag cleanup so update.sh's contract holds.
+	int need_neuter = !st->se_neutered;  // upgrade from a pre-neuter daemon
 	int forced_by_update = (access(SE_FORCED_FLAG, F_OK) == 0);
-	if (forced_by_update && src_drift) {
-		printf("SAFEEYES: update.sh already forced break; absorbing hash %lu\n",
+	if (forced_by_update && !need_neuter) {
+		printf("SAFEEYES: update.sh forced flag absorbed (hash %lu)\n",
 			src_hash);
 		st->se_src_hash = src_hash;
 		st->se_strict = want_strict;
@@ -1783,283 +1995,257 @@ static void safeeyes_run(struct passwd *pw, int dry, struct SafeEyesState *st) {
 		se_write_state(st);
 		src_drift = 0;
 		unlink(SE_FORCED_FLAG);
+	} else if (forced_by_update) {
+		// Legacy flag from the old update.sh, but our live config predates
+		// scheduler neutering: still (re)seed below rather than absorb.
+		unlink(SE_FORCED_FLAG);
 	}
 
 	if (src_drift)
 		printf("SAFEEYES: source config changed (hash %lu->%lu); re-seeding\n",
 			st->se_src_hash, src_hash);
 
-	// RESUME: quit+relaunch safeeyes with a fresh duration so its monotonic
-	// break timer is reset to the exact time remaining to 08:00. Patching the
-	// config in-place (old approach) left the running instance's timer frozen
-	// at the pre-suspend value, causing the countdown to drift by the total
-	// suspend duration — after several suspends the break could end well past
-	// 08:00. A quit+relaunch gives a clean monotonic start every time. The
-	// donotdisturb plugin (whose BadWindow crash on stale X windows motivated
-	// the old no-relaunch approach) is now disabled in the night config.
-	if (resumed && want_strict && !dry) {
-		printf("SAFEEYES: night resume; quit+relaunch for fresh timer\n");
-		copy_file_user(desired_src, se_dst, pw);
-		long long left = secs_until_morning(now);
-		if (patch_json_int(se_dst, "short_break_duration", left) == 0)
-			printf("SAFEEYES: night break = %llds (%.1fh) to 08:00\n",
-				left, left / 3600.0);
-		if (safeeyes_running()) safeeyes_quit(pw, dry);
-		st->se_src_hash = src_hash;
-		st->se_strict = want_strict;
-		st->se_paused_by_us = 0;
-		se_write_state(st);
-		need_force_break = 1;
-	} else if (resumed && !want_strict && st->se_meeting_phase != 1 && !dry) {
-		if (st->se_break_active) {
-			// A break was in progress when we suspended. SafeEyes' own
-			// PrepareForSleep handler (safeeyes.py handle_suspend_callback)
-			// calls core.stop() which CLOSES the break overlay, and on resume
-			// core.start() reschedules the NEXT break ~short_break_interval
-			// out -- the in-progress break is abandoned. So closing the lid
-			// mid-break would escape it. Re-impose a break for the TIME LEFT
-			// (like the night path) so a short suspend doesn't restart a full
-			// break and a near-complete break isn't needlessly re-imposed in
-			// full. We patch the live day config's short_break_duration to the
-			// remainder and force a SHORT break (-b); the running instance
-			// uses in-memory durations so we must quit+relaunch for the patch
-			// to take effect (persist_state=true preserves the next-break
-			// time across the relaunch, so the pomodoro schedule survives).
-			// se_need_restore makes a later cycle re-copy the real day config
-			// (5/30min durations) once this shortened break ends, so the next
-			// natural break isn't served at the wrong (shortened) duration.
-			long long orig_dur = 300;  // default short
-			if (st->se_break_type == 1)
-				orig_dur = get_json_int(desired_src, "long_break_duration", 1800);
-			else
-				orig_dur = get_json_int(desired_src, "short_break_duration", 300);
-			long long elapsed = 0;
-			if (st->se_break_start > 0)
-				// Preserve the original wall-clock deadline. Sleeping during a
-				// real break satisfies that break; only the idle Start-work gate
-				// pauses time during a work interval.
-				elapsed = (long long)(now - st->se_break_start);
-			if (elapsed < 0) elapsed = 0;
-			long long time_left = orig_dur - elapsed;
-			printf("SAFEEYES: day resume; break was active (type %s, orig %llds, "
-				"elapsed %llds, left %llds)\n",
-				st->se_break_type == 1 ? "long" : "short",
-				orig_dur, elapsed, time_left);
-			if (time_left > 0) {
-				copy_file_user(desired_src, se_dst, pw);
-				if (patch_json_int(se_dst, "short_break_duration",
-						time_left) == 0)
-					printf("SAFEEYES: re-imposing break = %llds left\n",
-						time_left);
-				if (safeeyes_running()) safeeyes_quit(pw, dry);
-				st->se_src_hash = src_hash;
-				st->se_strict = want_strict;
-				st->se_need_restore = 1;
-				// Keep se_break_start at the ORIGINAL break start so a SECOND
-				// suspend during this re-imposed break recomputes time-left
-				// from the true original duration (not the shortened one).
-				st->se_break_active = 1;  // optimistic: -b in flight
-				se_write_state(st);
-				need_force_break = 1;  // uses -b below (short, =time_left)
-				force_arg = "-b";
-				just_imposed_break = 1;
-			} else {
-				// The break ended during suspend. Safe Eyes should close it from
-				// its own resume handler; if that signal was missed, terminate the
-				// stale overlay and launch a fresh work interval below.
-				printf("SAFEEYES: break already elapsed; not re-imposing\n");
-				if (access(SE_STARTWORK_FLAG, F_OK) != 0 && safeeyes_running()) {
-					printf("SAFEEYES: ending stale elapsed overlay\n");
-					copy_file_user(desired_src, se_dst, pw);
-					safeeyes_quit(pw, dry);
-					just_imposed_break = 1;
-				}
-				st->se_break_active = 0;
-				st->se_break_type = -1;
-				st->se_break_start = 0;
-				st->se_need_restore = 0;
-				st->se_src_hash = src_hash;
-				se_write_state(st);
-			}
-		}
-	} else if (boundary || src_drift) {
-		// A DAY src-drift (edited safeeyes.json, or `make update` re-deployed
-		// it) used to quit+relaunch SafeEyes to apply the new config within
-		// ~30s. But SafeEyes does NOT persist the next-break countdown
-		// (session.json stores only the break name + plugin stats, not the
-		// scheduled time), so a relaunch ALWAYS resets to a fresh full work
-		// interval -- i.e. `make update` mid-cycle threw away 25min of earned
-		// work time and restarted a 30-min countdown. To avoid that: on a pure
-		// day src-drift (NOT a mode boundary) while SafeEyes is already
-		// running, just SEED the live config (so it's staged) and absorb the
-		// hash WITHOUT restarting. The running instance keeps its current
-		// timer; the new config takes effect at the next natural restart
-		// (00:00/08:00 boundary, or a suspend-resume). A mode boundary, a
-		// night src-drift, or "not running" still restart (boundary needs a
-		// mode swap; night is a continuous block that must reload; not-running
-		// has no timer to preserve, so a fresh launch is harmless).
-		int day_drift_preserve = (src_drift && !boundary && !want_strict
-			&& safeeyes_running() && !dry);
-		printf("SAFEEYES: %s config (mode %s->%s%s%s)\n",
+	if (src_drift || boundary || need_neuter) {
+		printf("SAFEEYES: %s config (mode %s->%s%s)\n",
 			st->se_strict < 0 ? "initial seed" : "boundary swap",
 			st->se_strict < 0 ? "?" : (st->se_strict ? "night" : "day"),
 			want_strict ? "night" : "day",
-			src_drift ? " + src drift" : "",
-			day_drift_preserve ? " (preserve timer)" : "");
+			need_neuter ? " + scheduler neutering" : "");
 		if (!dry) {
 			copy_file_user(desired_src, se_dst, pw);
-			if (want_strict) {
-				long long left = secs_until_morning(now);
-				if (patch_json_int(se_dst, "short_break_duration", left) == 0)
-					printf("SAFEEYES: night break = %llds (%.1fh) to 08:00\n",
-						left, left / 3600.0);
-			}
-			if (!day_drift_preserve && safeeyes_running())
+			patch_json_int(se_dst, "short_break_interval", SE_NEUTERED_INTERVAL);
+			patch_json_int(se_dst, "long_break_interval", SE_NEUTERED_INTERVAL);
+			st->se_neutered = 1;
+			if (safeeyes_running()) {
 				safeeyes_quit(pw, dry);
+				relaunched = 1;
+			}
 		}
 		st->se_strict = want_strict;
 		st->se_src_hash = src_hash;
-		if (want_strict) st->se_paused_by_us = 0;
-		se_write_state(st);
-		need_force_break = (want_strict && !day_drift_preserve);
-	}
-
-	// Restore the real day config after a time-left re-imposition. We patched
-	// short_break_duration to the remainder and relaunched; the running instance
-	// now serves SHORT breaks at that shortened duration. Once the re-imposed
-	// break is OVER (no overlay up) we re-copy the source day config (5/30min
-	// durations) and relaunch so the next natural break isn't served too short.
-	// We must NOT restore while the break overlay is still up (that would quit
-	// the in-progress break early). persist_state=true preserves the next-break
-	// time across this relaunch, so the pomodoro schedule survives.
-	if (!dry && !want_strict && st->se_need_restore && safeeyes_running()
-			&& !just_imposed_break) {
-		int bs = break_status(pw, dry);
-		long long orig_dur = st->se_break_type == 1
-			? get_json_int(desired_src, "long_break_duration", 1800)
-			: get_json_int(desired_src, "short_break_duration", 300);
-		long long elapsed = st->se_break_start > 0
-			? (long long)(now - st->se_break_start) : orig_dur;
-		if (bs == 0 || elapsed >= orig_dur) {
-			if (elapsed < orig_dur) {
-				// Wnck can briefly miss the newly-created overlay after resume.
-				// Never let that transient IDLE result end the recovered break.
-				printf("SAFEEYES: re-imposed break not visible, but %llds remain "
-					"before its deadline; not restoring\n", orig_dur - elapsed);
-			} else {
-				if (bs != 0)
-					printf("SAFEEYES: original break deadline elapsed; ending "
-						"re-imposed overlay\n");
-				// BUT: the cb_startwork plugin may be showing its "Start work"
-				// dialog right now (core.stop() was called, so break_status sees
-				// no overlay). If we quit+relaunch here we kill the process
-				// holding that dialog and abandon the start-work gate. Wait for
-				// the user to press Start (which removes the sentinel) before
-				// restoring. The 30s cycle will re-check next time.
-				if (access(SE_STARTWORK_FLAG, F_OK) == 0) {
-					printf("SAFEEYES: re-imposed break over, but cb_startwork "
-						"dialog is up; waiting for Start press\n");
-				} else {
-					printf("SAFEEYES: re-imposed break over; restoring day config\n");
-					copy_file_user(desired_src, se_dst, pw);
-					if (safeeyes_running()) safeeyes_quit(pw, dry);
-					st->se_src_hash = src_hash;
-					st->se_need_restore = 0;
-					st->se_break_active = 0;
-					st->se_break_type = -1;
-					st->se_break_start = 0;
-					se_write_state(st);
-					// The relaunch above restarts SE; let keep-alive below handle
-					// it, and skip break tracking this cycle (fresh instance).
-					just_imposed_break = 1;
-				}
-			}
+		if (want_strict) {
+			// Entering night: any day pomodoro bookkeeping is void.
+			st->se_paused_by_us = 0;
+			st->se_break_active = 0;
+			st->se_break_type = -1;
+			st->se_break_start = 0;
+			st->se_work_end = 0;
+			st->se_gate_start = 0;
+			st->se_work_left_at_gate = -1;
+			st->se_cycle = 0;
 		}
+		se_write_state(st);
 	}
 
 	// Keep-alive / initial launch.
-	if (!safeeyes_running()) {
-		// Night: a killed SafeEyes must not relaunch with the duration seeded
-		// at the 00:00 boundary (a flat 480 min that would end past 08:00).
-		// Re-seed the live config with the seconds REMAINING to 08:00 and
-		// force the break up immediately (-t), mirroring the resume path.
-		if (want_strict && !dry) {
-			copy_file_user(desired_src, se_dst, pw);
-			long long left = secs_until_morning(now);
-			if (patch_json_int(se_dst, "short_break_duration", left) == 0)
-				printf("SAFEEYES: night break = %llds (%.1fh) to 08:00\n",
-					left, left / 3600.0);
-			need_force_break = 1;
-		}
+	int se_was_dead = !safeeyes_running();
+	if (se_was_dead) {
 		printf("SAFEEYES: not running; launching\n");
 		if (!dry) launch_safeeyes(pw);
 	}
 
-	// Force the night break overlay up NOW. SafeEyes' resume handler (or a
-	// fresh launch) sets state=WAITING then waits short_break_interval (~1
-	// min) before the break fires naturally. -t overrides that -- but only
-	// works once state==WAITING. After a relaunch the GApplication needs time
-	// to register; after a resume SafeEyes' own handler needs a moment. So
-	// retry -t across the remaining cycle budget (~20s) at 2s intervals.
-	if (need_force_break && !dry) {
-		// Wait for safeeyes to be running (after a relaunch).
-		for (int i = 0; i < 8 * 4 && !safeeyes_running(); i++) usleep(250 * 1000);
-		// Retry: SafeEyes may not be in WAITING state yet.
-		for (int i = 0; i < 10 && safeeyes_running(); i++) {
-			printf("SAFEEYES: forcing break (%s) now (attempt %d)\n",
-				force_arg, i + 1);
-			int rc = safeeyes_cmd(pw, force_arg);
-			if (rc == 0) {
-				printf("SAFEEYES: %s accepted\n", force_arg);
-				break;
-			}
-			usleep(2000 * 1000);
+	if (want_strict) {
+		// --- NIGHT: one continuous block until 08:00 -----------------------
+		// The daemon owns the duration: impose secs-until-morning explicitly
+		// whenever the overlay is not up (first launch, resume from suspend,
+		// a killed/lost overlay). No config duration patching, no
+		// quit+relaunch on resume -- the impose carries the exact remainder.
+		calendar_meeting_run(pw, dry, want_strict, resumed, st);
+		if (dry) {
+			printf("DRY RUN: night; would ensure overlay (%llds to 08:00)\n",
+				secs_until_morning(now));
+			return;
+		}
+		se_write_schedule(st, 1, now);
+		if (relaunched || !safeeyes_running()) {
+			// Fresh instance (or none): no overlay possible; impose directly.
+			long long left = secs_until_morning(now);
+			if (safeeyes_impose(pw, dry, 1, left) == 0)
+				just_imposed = 1;
+			return;
+		}
+		int nbs = break_status(pw, dry);
+		if (nbs == 1 || nbs == 2 || nbs == 3)
+			return;  // overlay already up
+		if (nbs == -1)
+			return;  // can't tell (X down?); retry next cycle
+		long long left = secs_until_morning(now);
+		printf("SAFEEYES: night overlay down; re-imposing (%llds to 08:00)\n",
+			left);
+		if (safeeyes_impose(pw, dry, 1, left) == 0)
+			just_imposed = 1;
+		return;
+	}
+
+	// --- DAY ----------------------------------------------------------------
+	// Restore a break that was interrupted, so it cannot be escaped:
+	//   * suspended mid-break -- the sleep counts toward the break; the
+	//     core's wall-clock countdown also ends a surviving overlay by
+	//     itself, but if the overlay was closed (or SE quit) we re-impose;
+	//   * SafeEyes died or we relaunched it ourselves (killed process, seed
+	//     relaunch on drift/boundary) while a break was up.
+	// In all cases re-impose the time LEFT from the original wall-clock
+	// deadline. If the interruption outlasted the break, it is satisfied:
+	// advance the cycle and let the work clock re-arm below (the plugin
+	// skips its Start dialog after a suspend, so no gate).
+	if (!dry && st->se_break_active && (resumed || se_was_dead || relaunched)) {
+		long long orig_dur = st->se_break_type == 1 ? long_dur : short_dur;
+		long long elapsed = st->se_break_start > 0
+			? (long long)(now - st->se_break_start) : orig_dur;
+		if (elapsed < 0) elapsed = 0;
+		long long time_left = orig_dur - elapsed;
+		printf("SAFEEYES: day resume; break was active (type %s, orig %llds, "
+			"elapsed %llds, left %llds)\n",
+			st->se_break_type == 1 ? "long" : "short",
+			orig_dur, elapsed, time_left);
+		if (time_left > 0) {
+			// No relaunch needed: impose the remainder over the (frozen or
+			// closed) overlay. Keep the ORIGINAL break_start so a second
+			// suspend during this break recomputes from the true deadline.
+			if (safeeyes_impose(pw, dry, st->se_break_type == 1,
+					time_left) == 0)
+				just_imposed = 1;
+			else
+				printf("SAFEEYES: re-impose failed; retrying next cycle\n");
+		} else {
+			printf("SAFEEYES: break already elapsed; satisfied by sleep\n");
+			int was_long = (st->se_break_type == 1);
+			st->se_break_active = 0;
+			st->se_break_type = -1;
+			st->se_break_start = 0;
+			st->se_cycle = se_cycle_after_break(st->se_cycle, was_long);
+			se_write_state(st);
 		}
 	}
 
-	// A calendar occurrence may interrupt an active daytime break, but calendar
-	// synchronization itself starts only from a normal work interval.
-	int bs = -1;
-	if (!dry && !want_strict && safeeyes_running() && !just_imposed_break)
-		bs = break_status(pw, dry);
-	else if (dry && !want_strict)
-		bs = 0;
-	calendar_meeting_run(pw, dry, want_strict, resumed, st);
+	// Resume during a WORK interval: suspend time is NOT work time. A short
+	// sleep PAUSES the countdown (the deadline is pushed by the sleep
+	// duration -- the remaining work is fully owed after wake). A sleep
+	// LONGER than the work time that was left when the machine went down
+	// ignores the pending break entirely: the cycle advances and a fresh
+	// interval starts at wake (you rested longer than the break was worth).
+	if (!dry && resumed && !st->se_break_active && st->se_work_end > 0) {
+		int skip_pending = 0;
+		time_t new_end = se_work_resume_adjust(st->se_work_end, now,
+			slept, work_interval, &skip_pending);
+		if (skip_pending) {
+			printf("SAFEEYES: suspend %llds was longer than the work time "
+				"left; skipping the pending %s break\n", slept,
+				(st->se_cycle & 3) == 3 ? "long" : "short");
+			st->se_cycle = (st->se_cycle + 1) & 3;
+		} else {
+			printf("SAFEEYES: suspend %llds during work; deadline pushed "
+				"(work resumes where it left off)\n", slept);
+		}
+		st->se_work_end = new_end;
+		se_write_state(st);
+	}
 
-	// Track whether a break overlay is currently up (DAY only) so the NEXT
-	// cycle's resume detection can re-impose it (for the time left) if the
-	// machine is suspended mid-break. This must run AFTER the resume decision
-	// above (which uses the PRE-suspend value read at cycle start) and after any
-	// -b/-t we just sent. Night doesn't need this: the night-resume path
-	// reseeds+forces the block unconditionally regardless of prior state.
-	// On a 0->1 transition (break just started), record its wall-clock start and
-	// type. A later resume re-imposes the break only until its original deadline;
-	// sleep during an actual break counts toward completing that break.
-	if (!dry && !want_strict && safeeyes_running() && !just_imposed_break) {
+	// Overlay polling (skip when we just relaunched or imposed: Wnck can
+	// briefly miss a newly-created overlay, and a fresh instance has none).
+	int bs = -1;
+	if (!dry && safeeyes_running() && !relaunched && !just_imposed)
+		bs = break_status(pw, dry);
+
+	// Track overlay transitions so the cycle counter advances when a break
+	// completes. On a 0->1 transition record the wall-clock start + type
+	// (preferring the live classification, falling back to the type we
+	// imposed) so a suspend mid-break can recompute the time left.
+	int break_ended_this_cycle = 0;
+	if (!dry && safeeyes_running() && !relaunched && !just_imposed) {
 		if (bs == 1 || bs == 2 || bs == 3) {  // a break is up
 			if (!st->se_break_active) {  // 0->1 transition: record start+type
 				st->se_break_start = now;
-				st->se_break_type = (bs == 2) ? 1 : 0;  // long=1, short/unknown=0
+				if (bs == 2) st->se_break_type = 1;
+				else if (bs == 1) st->se_break_type = 0;
+				else if (st->se_break_type < 0) st->se_break_type = 0;
+				st->se_break_active = 1;
+				// A break we did NOT impose this cycle (the tray's manual
+				// "Take a break now") replaces the current work phase, just
+				// like an imposed one: breaks bracket work intervals in the
+				// scheme, so its end + Start gate leads into a FRESH
+				// interval rather than a stale remainder. It still counts
+				// as a taken break (se_cycle advances on its end below).
+				if (st->se_work_end > 0) {
+					printf("SAFEEYES: break not imposed by us (manual?); "
+						"disarming work clock\n");
+					st->se_work_end = 0;
+				}
 				printf("SAFEEYES: break started (type %s) at %lld\n",
 					st->se_break_type == 1 ? "long" : "short",
 					(long long)now);
-			}
-			if (!st->se_break_active) {
-				st->se_break_active = 1;
 				se_write_state(st);
 			}
 		} else if (bs == 0) {  // IDLE
 			if (st->se_break_active) {
+				int was_long = (st->se_break_type == 1);
 				st->se_break_active = 0;
 				st->se_break_type = -1;
 				st->se_break_start = 0;
+				st->se_cycle = se_cycle_after_break(st->se_cycle, was_long);
+				break_ended_this_cycle = 1;
+				printf("SAFEEYES: break ended; %d cycle(s) until long\n",
+					3 - (st->se_cycle & 3));
+				se_write_state(st);
+				// Do NOT arm work here: the cb_startwork Start gate is about
+				// to appear (within ~1s). The gate branch freezes/arms on
+				// release; if the plugin fails to show it, the next cycle
+				// arms a fresh interval below.
+			}
+		}
+	}
+
+	// A calendar occurrence may interrupt an active daytime break, but
+	// calendar synchronization itself starts only from a normal work interval.
+	calendar_meeting_run(pw, dry, want_strict, resumed, st);
+
+	// While a meeting pause (or a legacy AV pause) holds SafeEyes disabled,
+	// the work clock is disarmed; when the pause ends, a FRESH interval is
+	// armed below (matching the old disable/enable reset behavior).
+	int meeting_hold = (st->se_meeting_phase != 0 || st->se_paused_by_us);
+	if (meeting_hold && st->se_work_end > 0) {
+		printf("SAFEEYES: meeting pause; disarming work clock\n");
+		st->se_work_end = 0;
+		st->se_work_left_at_gate = -1;
+		se_write_state(st);
+	}
+
+	// Work-interval decisions.
+	if (!dry && !st->se_break_active && !meeting_hold
+			&& !startwork_dialog_up && !relaunched && !just_imposed
+			&& !break_ended_this_cycle) {
+		if (st->se_work_end == 0) {
+			// Disarmed with no gate, no overlay, no meeting: arm a FRESH
+			// interval. Covers: first run, daemon restart with lost fields,
+			// a break that ended without a Start gate (suspend-skip path),
+			// and the end of a meeting pause.
+			st->se_work_end = now + work_interval;
+			printf("SAFEEYES: arming fresh work interval (%llds, %d cycle(s) "
+				"until long)\n", work_interval, 3 - (st->se_cycle & 3));
+			se_write_state(st);
+		} else if (now >= st->se_work_end) {
+			// Work interval over: impose the due break (type by cycle
+			// count: every 4th is the long one). Suspend handling happens
+			// in the resume blocks above (skip/shift), so a deadline that
+			// is past while awake means the break is simply due.
+			int is_long = (st->se_cycle & 3) == 3;
+			long long dur = is_long ? long_dur : short_dur;
+			printf("SAFEEYES: work interval over; imposing %s break "
+				"(%llds)\n", is_long ? "long" : "short", dur);
+			if (safeeyes_impose(pw, dry, is_long, dur) == 0) {
+				st->se_break_active = 1;  // optimistic: suspend within
+				                          // ~30s still recomputes left
+				st->se_break_type = is_long;
+				st->se_break_start = now;
+				st->se_work_end = 0;
+				just_imposed = 1;
 				se_write_state(st);
 			}
 		}
 	}
 
-	// The caller records the cycle-end wall clock after pause_run so fallback
-	// resume detection measures only the interval between enforcement passes.
+	// Publish the real schedule for the tray (see se_write_schedule).
+	if (!dry) se_write_schedule(st, want_strict, now);
 }
 
 // --- pause / math challenge ------------------------------------------------

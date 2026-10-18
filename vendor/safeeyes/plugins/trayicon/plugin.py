@@ -17,6 +17,8 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import datetime
+import os
+import time
 from safeeyes.model import BreakType
 import gi
 
@@ -33,6 +35,40 @@ Safe Eyes tray icon plugin
 """
 
 tray_icon: typing.Optional["TrayIcon"] = None
+
+# VENDORED PATCH (ChickenBlocker): the daemon owns ALL break timing; the
+# built-in scheduler is neutered (huge intervals), so the times computed
+# from it would be nonsense ("next break in 7 days", "Interval 1/1"). The
+# daemon publishes the REAL schedule (next break, next long break, current
+# cycle X/4, night flag) to this file every ~30s cycle; the tray displays
+# that instead. If the file is missing or stale (daemon down), fall back to
+# the upstream computation.
+CB_SCHEDULE_FILE = "/tmp/cb_se_schedule"
+CB_SCHEDULE_STALE_SECS = 300
+
+
+def _cb_read_daemon_schedule():
+    """Return the daemon's schedule dict, or None when unavailable/stale."""
+    try:
+        with open(CB_SCHEDULE_FILE) as f:
+            raw = f.read()
+        age = time.time() - os.stat(CB_SCHEDULE_FILE).st_mtime
+    except Exception:
+        return None
+    if age > CB_SCHEDULE_STALE_SECS:
+        return None
+    sched = {"night": 0, "next_break": 0, "next_long": 0, "interval": 0, "total": 4}
+    for line in raw.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in sched:
+            try:
+                sched[key] = int(value.strip())
+            except ValueError:
+                return None
+    return sched
 safeeyes_config = None
 
 SNI_NODE_INFO = Gio.DBusNodeInfo.new_for_xml(
@@ -530,8 +566,25 @@ class TrayIcon:
         self.plugin_config = plugin_config
         self.allow_disabling = plugin_config["allow_disabling"]
 
+        # VENDORED PATCH (ChickenBlocker): with the neutered scheduler the
+        # app itself never fires update_next_break, so refresh the displayed
+        # schedule from the daemon's file once a minute (guarded so a config
+        # reload does not stack timers).
+        if not getattr(self, "_cb_schedule_timer", False):
+            self._cb_schedule_timer = True
+            GLib.timeout_add_seconds(60, self._cb_daemon_schedule_tick)
+
         self.update_menu()
         self.update_tooltip()
+
+    def _cb_daemon_schedule_tick(self):
+        try:
+            if _cb_read_daemon_schedule() is not None:
+                self.update_menu()
+                self.update_tooltip()
+        except Exception:
+            pass
+        return True  # keep the timer alive
 
     def unregister(self) -> None:
         self.sni_service.unregister()
@@ -570,6 +623,12 @@ class TrayIcon:
                             }
                     else:
                         info_message = _("Next break at %s") % (next_time)
+                elif _cb_read_daemon_schedule() is not None:
+                    # VENDORED PATCH (ChickenBlocker): the daemon owns the
+                    # schedule but nothing is armed right now (Start-work
+                    # gate / pause) -- say that instead of the misleading
+                    # "No Breaks Available".
+                    info_message = _("Waiting for the next work session")
             else:
                 if self.wakeup_time:
                     info_message = _("Disabled until %s") % utility.format_time(
@@ -749,7 +808,29 @@ class TrayIcon:
         self.update_tooltip()
 
     def get_next_break_time(self):
-        if not (self.has_breaks() and self.active and self.date_time):
+        if not (self.has_breaks() and self.active):
+            return None
+
+        # VENDORED PATCH (ChickenBlocker): display the daemon-owned schedule
+        # (see CB_SCHEDULE_FILE) instead of the neutered scheduler's times.
+        sched = _cb_read_daemon_schedule()
+        if sched is not None:
+            if sched["night"]:
+                wake = utility.format_time(
+                    datetime.datetime.fromtimestamp(sched["next_break"])
+                )
+                return (wake, wake, True)
+            if sched["next_break"] <= 0:
+                return None  # gate/disarmed: no scheduled break to show
+            next_time = utility.format_time(
+                datetime.datetime.fromtimestamp(sched["next_break"])
+            )
+            long_time = utility.format_time(
+                datetime.datetime.fromtimestamp(sched["next_long"])
+            )
+            return (next_time, long_time, next_time == long_time)
+
+        if not self.date_time:
             return None
 
         formatted_time = utility.format_time(self.get_break_time())
@@ -766,7 +847,19 @@ class TrayIcon:
 
     def get_interval_progress(self):
         """Return the current work interval and intervals per long-break cycle."""
-        if not (self.has_breaks() and self.active and self.date_time):
+        if not (self.has_breaks() and self.active):
+            return None
+
+        # VENDORED PATCH (ChickenBlocker): the daemon tracks the pomodoro
+        # cycle; the interval ratio derived from the neutered config would
+        # always read "1/1".
+        sched = _cb_read_daemon_schedule()
+        if sched is not None:
+            if sched["interval"] <= 0:
+                return None
+            return (sched["interval"], max(1, sched["total"]))
+
+        if not self.date_time:
             return None
 
         short_interval = safeeyes_config.get("short_break_interval")

@@ -1,4 +1,5 @@
 #define CHICKENBLOCKER_TEST
+#define SE_SCHEDULE_FILE "/tmp/kilo_cb_se_schedule_test"
 #include "../src/ChickenBlocker.c"
 
 #include <assert.h>
@@ -90,6 +91,70 @@ int main(void) {
 	local_hour_for(hour_9, state.se_cal_hour);
 	assert(!calendar_sync_due(&state, hour_9));
 	assert(calendar_sync_due(&state, next_day));
+
+	// Work-deadline adjustment on resume: suspend is NOT work time. A short
+	// sleep pauses the countdown (deadline pushed by the sleep duration,
+	// remaining work fully owed); a sleep >= the work time left at sleep
+	// start skips the pending break and starts a fresh interval at wake.
+	// Numbers are anchored at sleep_start = wake - slept.
+	int skip = -1;
+	time_t wake = 1000000;
+	// 20 min owed at sleep start, 5-min sleep: still owe 20 min after wake
+	time_t work_end = (wake - 300) + 1200;
+	assert(se_work_resume_adjust(work_end, wake, 300, 1800, &skip) == wake + 1200);
+	assert(skip == 0);
+	// sleep exactly as long as the time left -> skip + fresh interval
+	time_t exact = (wake - 1200) + 1200;
+	assert(se_work_resume_adjust(exact, wake, 1200, 1800, &skip) == wake + 1800);
+	assert(skip == 1);
+	skip = 0;
+	// the Oct-17 incident shape: 76s of work left, 39-min sleep -> skip
+	time_t short_left = (wake - 2352) + 76;
+	assert(se_work_resume_adjust(short_left, wake, 2352, 1800, &skip) == wake + 1800);
+	assert(skip == 1);
+	skip = 0;
+	// 1s more owed than slept -> still a pause, not a skip
+	time_t owed_301 = (wake - 300) + 301;
+	assert(se_work_resume_adjust(owed_301, wake, 300, 1800, &skip) == owed_301 + 300);
+	assert(skip == 0);
+	// deadline already past pre-sleep (pathological) -> skip
+	time_t past = (wake - 60) - 10;
+	assert(se_work_resume_adjust(past, wake, 60, 1800, &skip) == wake + 1800);
+	assert(skip == 1);
+
+	// Tray schedule publisher: work armed + cycle 3 -> next break IS the
+	// long one, interval line 4/4.
+	{
+		struct SafeEyesState sched_st = {0};
+		sched_st.se_cycle = 3;
+		sched_st.se_work_end = 2000000;
+		se_write_schedule(&sched_st, 0, 1500000);
+		size_t n = 0;
+		char *buf = read_file(SE_SCHEDULE_FILE, &n);
+		assert(buf != NULL);
+		assert(strstr(buf, "night=0"));
+		assert(strstr(buf, "next_break=2000000"));
+		assert(strstr(buf, "next_long=2000000"));
+		assert(strstr(buf, "interval=4"));
+		assert(strstr(buf, "total=4"));
+		free(buf);
+		struct SafeEyesState night_st = {0};
+		se_write_schedule(&night_st, 1, 1500000);
+		buf = read_file(SE_SCHEDULE_FILE, &n);
+		assert(buf != NULL);
+		assert(strstr(buf, "night=1"));
+		assert(strstr(buf, "interval=0"));
+		free(buf);
+		unlink(SE_SCHEDULE_FILE);
+	}
+
+	// Cycle counter after a completed break: shorts advance, a long (imposed
+	// OR manual) ends the set.
+	assert(se_cycle_after_break(0, 0) == 1);
+	assert(se_cycle_after_break(2, 0) == 3);
+	assert(se_cycle_after_break(3, 0) == 0);   // short at cycle 3 wraps the set
+	assert(se_cycle_after_break(1, 1) == 0);   // long break resets the count
+	assert(se_cycle_after_break(3, 1) == 0);
 
 	puts("meeting state regressions: ok");
 	return 0;

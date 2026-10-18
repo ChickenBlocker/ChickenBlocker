@@ -1,8 +1,8 @@
 {
     "meta": {
         "name": "Start Work Confirmation",
-        "description": "After a break ends, show a dialog and wait for the user to press Start before the next work interval begins. Skips the dialog if the break was interrupted by a suspend (the machine slept), so waking up after a sleep just continues work. Also: if the user is away from the PC (no keyboard/mouse input and no browser video playing) for idle_gate_seconds, pause the remaining work time and show the same Start dialog until it is pressed; if the gate is then held (away/suspended) for idle_gate_reset_seconds or longer, Start begins a fresh full work interval instead of restoring the stale remaining time. REQUIRES the smartpause plugin to be disabled.",
-        "version": "0.0.3"
+        "description": "After a break ends, show a dialog and wait for the user to press Start before the next work interval begins. Skips the dialog if the break was interrupted by a suspend (the machine slept), so waking up after a sleep just continues work. Also: if the user is away from the PC (no keyboard/mouse input and no browser video playing) for idle_gate_seconds, pause and show the same Start dialog until it is pressed. Work-interval timing across the gate is owned by the ChickenBlocker daemon, which re-arms its own work deadline when the Start sentinel clears. REQUIRES the smartpause plugin to be disabled.",
+        "version": "0.0.4"
     },
     "dependencies": {
         "python_modules": [],
@@ -41,12 +41,6 @@
             "label": "Idle check interval (seconds)",
             "type": "INT",
             "default": 5
-        },
-        {
-            "id": "idle_gate_reset_seconds",
-            "label": "Start a fresh work interval after being away this long (seconds)",
-            "type": "INT",
-            "default": 1800
         }
     ],
     "break_override_allowed": false

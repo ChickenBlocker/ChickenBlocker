@@ -68,6 +68,12 @@ class SafeEyesCore:
     # set to true when a break was requested
     _take_break_now: bool = False
 
+    # VENDORED PATCH (ChickenBlocker): set by impose_break() when the
+    # ChickenBlocker daemon (the sole owner of pomodoro timing) commands an
+    # overlay of a specific type + duration. Consumed by __do_pre_break after
+    # the wakeup_scheduler handshake, bypassing the (neutered) scheduler.
+    _imposed: typing.Optional[typing.Tuple] = None
+
     def __init__(self, context: Context) -> None:
         """Create an instance of SafeEyesCore and initialize the variables."""
         # This event is fired before <time-to-prepare> for a break
@@ -190,12 +196,49 @@ class SafeEyesCore:
         self.__wakeup_scheduler()
         return True
 
+    def impose_break(
+        self, break_type: typing.Optional[BreakType], duration: int
+    ) -> bool:
+        """VENDORED PATCH (ChickenBlocker): show a break of the given type and
+        duration NOW, bypassing the scheduler. ChickenBlocker owns all break
+        timing; the built-in scheduler intervals are seeded huge so they never
+        fire on their own. Requires the core to be RUNNING with an armed
+        __wait_for (the normal WAITING state): the armed wait is consumed via
+        __wakeup_scheduler and __do_pre_break dispatches to resume_break()
+        with the requested duration. Returns True if honoured (or nothing to
+        do), False if no wait is armed yet (fresh launch) so the remote CLI
+        caller exits non-zero and the daemon retries.
+        """
+        if self._break_queue is None:
+            return True
+        if self._taking_break is not None:
+            # A break is already showing; nothing to impose. The daemon polls
+            # the overlay and will not retry.
+            return True
+        if not self.running:
+            # Stopped core (Start-work gate / disabled) cannot take the
+            # armed-wait path; the SafeEyes.impose_break wrapper handles this
+            # case by resuming directly. Signal failure so the CLI retries if
+            # the wrapper did not cover it.
+            return False
+        if self._callback is None and not self._firing_hook:
+            logging.warning(
+                "impose_break requested but no scheduler wait is armed yet; "
+                "caller should retry"
+            )
+            return False
+
+        self._imposed = (break_type, int(duration))
+
+        self.__wakeup_scheduler()
+        return True
+
     def resume_break(
         self, break_type: typing.Optional[BreakType], duration: int
     ) -> None:
         """VENDORED PATCH (ChickenBlocker): re-impose a break that was running when
         the system suspended, with a custom countdown in seconds, bypassing the
-        normal scheduler. The caller (SafeEyes.handle_suspend_callback) must set
+        normal scheduler. The caller (SafeEyes.impose_break / __do_pre_break) must ensure
         running=True first and ensure no __wait_for is active (i.e. the core was
         stopped). Mirrors __do_start_break's break-showing path (fire
         on_start_break + start_break hooks to bring up the screen) then runs the
@@ -308,6 +351,24 @@ class SafeEyesCore:
             # This can be reached if another thread changed running while __wait_for was
             # blocking
             self._take_break_now = False
+            self._imposed = None
+            return
+
+        if self._imposed is not None:
+            # VENDORED PATCH (ChickenBlocker): an imposed break (daemon-owned
+            # schedule) wins over any natural scheduler flow: show it directly
+            # with the requested duration via resume_break, which skips the
+            # pre-break warning/notification and the configured duration.
+            # Clear a pending -t/-b request too, so it cannot resurface as a
+            # natural break at the next pre-break after the imposed one ends.
+            imposed_type, imposed_duration = self._imposed
+            self._imposed = None
+            self._take_break_now = False
+            logging.info(
+                "Take a break due to external impose request (%ss)",
+                imposed_duration,
+            )
+            self.resume_break(imposed_type, imposed_duration)
             return
 
         if self._take_break_now:
