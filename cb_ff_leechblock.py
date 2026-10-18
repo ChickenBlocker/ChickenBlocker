@@ -20,6 +20,8 @@
 #                                     and 6 (URL); inits them if absent
 #   add-sites <set> "s1 s2 ..."       APPEND site patterns to a set's site
 #                                     list and recompile its blockRE
+#   add-regex <set> "regex"            APPEND a raw URL regex while preserving
+#                                     the set's ordinary site patterns
 #
 #   cb_ff_leechblock.py [sqlite] list
 #   cb_ff_leechblock.py [sqlite] add-rule   --keywords "w1 w2 ..." \
@@ -28,6 +30,7 @@
 #   cb_ff_leechblock.py [sqlite] add-keywords "w1 w2 ..." \
 #       [--kw-set 5] [--url-set 6] [--print]
 #   cb_ff_leechblock.py [sqlite] add-sites <set> "s1 s2 ..." [--print]
+#   cb_ff_leechblock.py [sqlite] add-regex <set> "regex" [--print]
 #
 # The <sqlite> path is optional; if omitted it is inferred from profiles.ini
 # (snap path ~/snap/firefox/common/.mozilla/firefox first, then the classic
@@ -140,6 +143,23 @@ def recompile_from_sites(d, n):
     d["allowRE%d" % n] = compiled["allow"]
     d["referRE%d" % n] = compiled["refer"]
     d["keywordRE%d" % n] = compiled["keyword"]
+
+
+def _custom_regex(regexp_block, block_re):
+    """Return the custom part of a regexpBlock managed by this tool."""
+    if not regexp_block:
+        return ""
+    if block_re:
+        prefix = "(?:%s)|(?:" % block_re
+        if regexp_block.startswith(prefix) and regexp_block.endswith(")"):
+            return regexp_block[len(prefix):-1]
+    return regexp_block
+
+
+def _combine_site_and_custom_regex(block_re, custom_re):
+    if block_re and custom_re:
+        return "(?:%s)|(?:%s)" % (block_re, custom_re)
+    return custom_re
 
 
 def keyword_tokens_in_sites(sites):
@@ -409,13 +429,44 @@ def cmd_add_sites(d, args):
     if not appended:
         print("no new sites to add to set %d (all already present)" % n)
         return None
+    old_block_re = d.get("blockRE%d" % n, "") or ""
+    regexp_key = "regexpBlock%d" % n
+    custom_re = _custom_regex(d.get(regexp_key, "") or "", old_block_re)
     combined = (existing + appended)
     d["sites%d" % n] = " ".join(combined)
     recompile_from_sites(d, n)
-    # Preserve regexpBlock if present (URL-regex sets); do not touch schedule
-    # keys of pre-existing timed sets (1-4) so their limits stay intact.
+    if custom_re:
+        d[regexp_key] = _combine_site_and_custom_regex(
+            d.get("blockRE%d" % n, "") or "", custom_re)
+    # Do not touch schedule keys of pre-existing timed sets (1-4), so their
+    # limits stay intact.
     return ("appended %d site(s) to set %d: %s" %
             (len(appended), n, " ".join(appended)))
+
+
+def cmd_add_regex(d, args):
+    if len(args) < 2:
+        sys.exit("ERROR: add-regex needs <set> <regex>, e.g. "
+                 "add-regex 2 'multclub\\d+\\.lol'")
+    n = int(args[0])
+    if n < 1 or n > NUM_SETS:
+        sys.exit("ERROR: set must be 1..%d" % NUM_SETS)
+    new_re = args[1]
+    if not new_re:
+        sys.exit("ERROR: regex must not be empty")
+    block_re = d.get("blockRE%d" % n, "") or ""
+    regexp_key = "regexpBlock%d" % n
+    custom_re = _custom_regex(d.get(regexp_key, "") or "", block_re)
+    if custom_re == new_re or new_re in custom_re.split("|"):
+        print("no new regex to add to set %d (already present)" % n)
+        return None
+    if custom_re:
+        custom_re = "(?:%s)|(?:%s)" % (custom_re, new_re)
+    else:
+        custom_re = new_re
+    d[regexp_key] = _combine_site_and_custom_regex(block_re, custom_re)
+    bump_numsets(d, n)
+    return "appended URL regex to set %d: %s" % (n, new_re)
 
 
 # --- Page Keyword Filter managed-storage block list ----------------------
@@ -549,7 +600,7 @@ def cmd_kw_add(args):
               % ", ".join(removed))
 
 
-SUBCOMMANDS = {"list", "add-rule", "add-keywords", "add-sites",
+SUBCOMMANDS = {"list", "add-rule", "add-keywords", "add-sites", "add-regex",
                 "kw-list", "kw-add"}
 
 
@@ -592,6 +643,12 @@ SUBCOMMANDS
         APPEND site patterns to a set's site list and recompile its blockRE.
         Does NOT touch the set's limit/schedule/active keys, so timed sets
         (e.g. 1-4) keep their daily limits intact.
+        Options: [--print]
+
+    add-regex <set> 'regex'
+        APPEND a raw URL regex to a set. Common JavaScript regex escapes such
+        as \\d, \\w and \\s are preserved. Use single shell quotes so the shell
+        does not consume backslashes. Ordinary sites in the set remain active.
         Options: [--print]
 
     kw-list
@@ -660,7 +717,7 @@ def main():
     else:
         if len(args) < 2 or args[1] not in SUBCOMMANDS:
             sys.exit(USAGE + "\nERROR: expected a subcommand "
-                     "(list|add-rule|add-keywords|add-sites|kw-list|kw-add)")
+                     "(list|add-rule|add-keywords|add-sites|add-regex|kw-list|kw-add)")
         path = args[0]
         cmd = args[1]
         rest = args[2:]
@@ -673,11 +730,11 @@ def main():
         readonly = has_print
     elif cmd in readonly_cmds:
         readonly = True
-    elif cmd in ("add-keywords", "add-sites"):
+    elif cmd in ("add-keywords", "add-sites", "add-regex"):
         readonly = has_print
     else:
         sys.exit("unknown subcommand: %s "
-                 "(use list|add-rule|add-keywords|add-sites|kw-list|kw-add)" % cmd)
+                 "(use list|add-rule|add-keywords|add-sites|add-regex|kw-list|kw-add)" % cmd)
 
     con = open_db(path, readonly)
     d = load(con)
@@ -693,6 +750,8 @@ def main():
         summary = cmd_add_keywords(d, rest)
     elif cmd == "add-sites":
         summary = cmd_add_sites(d, rest)
+    elif cmd == "add-regex":
+        summary = cmd_add_regex(d, rest)
     else:
         con.close()
         sys.exit("unknown subcommand: %s" % cmd)
