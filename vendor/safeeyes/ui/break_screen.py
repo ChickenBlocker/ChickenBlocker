@@ -74,6 +74,34 @@ def _status_text() -> str:
     return "   ·   ".join(parts)
 
 
+# VENDORED PATCH (ChickenBlocker): screen lockers that are allowed to cover
+# the break screens (they must be able to grab input and lock the session;
+# see the keyboard-grab removal note in __lock_keyboard_x11 below).
+_SCREEN_LOCKER_WM_CLASSES = frozenset(
+    {
+        "xfce4-screensaver",
+        "light-locker",
+        "i3lock",
+        "xsecurelock",
+    }
+)
+
+
+def _read_x11_property(window, atom):
+    """Read a full X11 property from a window.
+
+    Returns a (property, ok) tuple; ok is False when the read failed (e.g.
+    the window was destroyed in the meantime), which callers treat as a
+    benign race and skip that tick.
+    """
+    from Xlib import X
+
+    try:
+        return window.get_full_property(atom, X.AnyPropertyType), True
+    except Exception:
+        return None, False
+
+
 class BreakScreen:
     """The fullscreen windows which prevent users from using the computer.
 
@@ -111,6 +139,13 @@ class BreakScreen:
             import Xlib.display
 
             self.x11_display = Xlib.display.Display()
+
+        # VENDORED PATCH (ChickenBlocker): state for the foreign-fullscreen
+        # watch (__start_foreign_fullscreen_watch_x11)
+        self._foreign_fs_timer = None
+        self._own_xids_x11 = set()
+        self._foreign_fs_failures = 0
+        self._foreign_fs_last_recovery = 0.0
 
     def initialize(self, config: Config) -> None:
         """Initialize the internal properties from configuration."""
@@ -289,6 +324,12 @@ class BreakScreen:
 
             i = i + 1
 
+        # VENDORED PATCH (ChickenBlocker): enforce the break layer against
+        # OTHER applications that become fullscreen while the break is
+        # running (X11 only; see __start_foreign_fullscreen_watch_x11).
+        if not self.context.is_wayland:
+            self.__start_foreign_fullscreen_watch_x11()
+
     def __update_count_down(self, count: str, enable_shortcut: bool) -> None:
         """Update the countdown on all break screens."""
         for window in self.windows:
@@ -316,12 +357,10 @@ class BreakScreen:
         # See https://specifications.freedesktop.org/wm-spec/1.3/ar01s05.html#id-1.6.8
         root_window = self.x11_display.screen().root
 
-        surface = window.get_surface()
+        xid = self.__window_xid_x11(window)
 
-        if surface is None or not isinstance(surface, GdkX11.X11Surface):
+        if xid is None:
             return
-
-        xid = GdkX11.X11Surface.get_xid(surface)
 
         root_window.send_event(
             Xlib.protocol.event.ClientMessage(
@@ -344,6 +383,223 @@ class BreakScreen:
         )
 
         self.x11_display.sync()
+
+    def __window_xid_x11(self, window: "BreakScreenWindow") -> typing.Optional[int]:
+        """Return the X11 window id of a break window, or None."""
+        surface = window.get_surface()
+        if surface is None or not isinstance(surface, GdkX11.X11Surface):
+            return None
+        try:
+            return int(GdkX11.X11Surface.get_xid(surface))
+        except Exception:
+            return None
+
+    def __collect_own_xids_x11(self) -> set:
+        """Collect the XIDs of all current break windows."""
+        xids = set()
+        for window in self.windows:
+            xid = self.__window_xid_x11(window)
+            if xid is not None:
+                xids.add(xid)
+        return xids
+
+    def __start_foreign_fullscreen_watch_x11(self) -> None:
+        """VENDORED PATCH (ChickenBlocker): re-raise the break screens when
+        another application becomes fullscreen during a break.
+
+        xfwm4 stacks a newly fullscreened foreign window above the break
+        screens even though they carry _NET_WM_STATE_ABOVE/STICKY. A single
+        low-frequency GLib timer polls the EWMH state of the active window
+        and restores the break layer when that happens. It never raises the
+        break screens over a screen locker (see _SCREEN_LOCKER_WM_CLASSES),
+        ignores ordinary focus changes, and never runs on Wayland.
+        """
+        if self.x11_display is None:
+            return
+        if self._foreign_fs_timer is not None:
+            return
+        self._own_xids_x11 = self.__collect_own_xids_x11()
+        self._foreign_fs_failures = 0
+        self._foreign_fs_last_recovery = 0.0
+        self._foreign_fs_timer = GLib.timeout_add(
+            250, self.__poll_foreign_fullscreen_x11
+        )
+
+    def __stop_foreign_fullscreen_watch_x11(self) -> None:
+        """Stop the foreign-fullscreen watch (break teardown)."""
+        timer = self._foreign_fs_timer
+        self._foreign_fs_timer = None
+        self._own_xids_x11 = set()
+        if timer is not None:
+            GLib.source_remove(timer)
+
+    def __poll_foreign_fullscreen_x11(self) -> bool:
+        """Timer callback: check the active window and recover if needed."""
+        if self._foreign_fs_timer is None:
+            # Teardown already ran: do not continue this callback.
+            return False
+        if not self.windows or self.x11_display is None:
+            self._foreign_fs_timer = None
+            return False
+        try:
+            own_xids = self._own_xids_x11 | self.__collect_own_xids_x11()
+            needed = self._check_foreign_fullscreen_x11(
+                self.x11_display, own_xids
+            )
+        except Exception:
+            # All expected races are handled inside the check; an exception
+            # here means the display is gone (session/VT teardown): stop.
+            logging.exception("Foreign fullscreen check failed")
+            self._foreign_fs_timer = None
+            return False
+        self._own_xids_x11 = own_xids
+        if not needed:
+            # Normal situation: re-arm the failure budget.
+            self._foreign_fs_failures = 0
+            return True
+        self.__recover_break_screens_x11()
+        return True
+
+    def __recover_break_screens_x11(self) -> None:
+        """Restore the break screens above a foreign fullscreen window."""
+        if self._foreign_fs_failures >= 5:
+            # The WM keeps the foreign window above us (or we are in a
+            # lock/suspend/VT transition): stand down instead of fighting
+            # in a tight loop. Re-arms automatically once the active window
+            # is no longer a foreign fullscreen window.
+            return
+        now = time.monotonic()
+        if now - self._foreign_fs_last_recovery < 1.0:
+            return
+        self._foreign_fs_last_recovery = now
+        self._foreign_fs_failures += 1
+        if self._foreign_fs_failures == 1:
+            logging.info(
+                "Another application became fullscreen during the break; "
+                "restoring the break screen(s)"
+            )
+        elif self._foreign_fs_failures >= 5:
+            logging.info(
+                "Break screen(s) not kept above the foreign fullscreen "
+                "window after %d attempts; standing down until focus or "
+                "fullscreen state changes",
+                self._foreign_fs_failures,
+            )
+        for window in list(self.windows):
+            try:
+                window.present()
+                monitor = getattr(window, "fullscreen_monitor", None)
+                if monitor is not None:
+                    window.fullscreen_on_monitor(monitor)
+                # xfwm4 can reorder its fullscreen layer after the original
+                # hint was applied: re-send ABOVE + STICKY after present().
+                self.__window_set_keep_above_x11(window)
+            except Exception:
+                logging.exception(
+                    "Failed to restore a break screen over a foreign "
+                    "fullscreen window"
+                )
+
+    @staticmethod
+    def _check_foreign_fullscreen_x11(display, own_xids: set) -> bool:
+        """Decide whether the break screens must be re-raised over the
+        currently active window (X11 only).
+
+        Returns True only when the active window is a foreign (non Safe
+        Eyes) window that currently has _NET_WM_STATE_FULLSCREEN and is not
+        one of the known screen lockers. Property read failures (destroyed
+        windows etc.) are benign races and return False.
+        """
+        try:
+            root = display.screen().root
+        except Exception:
+            return False
+
+        active_prop, ok = _read_x11_property(
+            root, display.intern_atom("_NET_ACTIVE_WINDOW")
+        )
+        if not ok:
+            return False
+        active_xid = BreakScreen._parse_active_window_xid(active_prop)
+        if active_xid is None or active_xid in own_xids:
+            return False
+
+        try:
+            active_window = display.create_resource_object(
+                "window", active_xid
+            )
+        except Exception:
+            # The active window died between the two reads: benign race.
+            return False
+
+        state_prop, ok = _read_x11_property(
+            active_window, display.intern_atom("_NET_WM_STATE")
+        )
+        if not ok:
+            return False
+        if not BreakScreen._state_atoms_contain_fullscreen(
+            state_prop, display.intern_atom("_NET_WM_STATE_FULLSCREEN")
+        ):
+            # Ordinary focus change (Alt-Tab etc.): must not raise anything.
+            return False
+
+        class_prop, ok = _read_x11_property(
+            active_window, display.intern_atom("WM_CLASS")
+        )
+        if not ok:
+            return False
+        if BreakScreen._wm_class_is_locker(class_prop):
+            # The screen locker must stay above the break screen.
+            return False
+
+        return True
+
+    @staticmethod
+    def _parse_active_window_xid(
+        prop,
+    ) -> typing.Optional[int]:
+        """Extract the active window XID from a _NET_ACTIVE_WINDOW property."""
+        if prop is None:
+            return None
+        value = getattr(prop, "value", None)
+        if not value:
+            return None
+        active_xid = value[0]
+        if not active_xid:
+            # 0 is the "None" window of the spec (no active window)
+            return None
+        try:
+            return int(active_xid)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _state_atoms_contain_fullscreen(state_prop, fullscreen_atom) -> bool:
+        """Check a _NET_WM_STATE property value for the FULLSCREEN atom."""
+        if state_prop is None:
+            return False
+        value = getattr(state_prop, "value", None)
+        if not value:
+            return False
+        return fullscreen_atom in tuple(value)
+
+    @staticmethod
+    def _wm_class_is_locker(class_prop) -> bool:
+        """Check a WM_CLASS property value against the locker classes."""
+        if class_prop is None:
+            return False
+        value = getattr(class_prop, "value", None)
+        if not value:
+            return False
+        if not isinstance(value, (bytes, bytearray)):
+            value = str(value).encode("utf-8", "replace")
+        for part in value.split(b"\x00"):
+            if not part:
+                continue
+            name = part.decode("utf-8", "replace").lower()
+            if name in _SCREEN_LOCKER_WM_CLASSES:
+                return True
+        return False
 
     def __lock_keyboard_x11(self) -> None:
         """Lock the keyboard to prevent the user from using keyboard shortcuts.
@@ -386,6 +642,9 @@ class BreakScreen:
 
     def __destroy_all_screens(self) -> None:
         """Close all the break screens."""
+        # Stop the foreign-fullscreen watch first so its callback cannot
+        # fight the teardown below.
+        self.__stop_foreign_fullscreen_watch_x11()
         for win in self.windows:
             win.stop_enforce_fullscreen()
             win.stop_fade_in()
