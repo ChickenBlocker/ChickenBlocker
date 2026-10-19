@@ -2845,17 +2845,31 @@ static int pause_handle_conn(int c, struct passwd *pw, const char *ff_sync_sqlit
 	return dirty;
 }
 
-// Run the pause poll loop for ~CYCLE_BUDGET seconds: keep the abstract socket
-// open, accept + verify + handle cb-pause clients, and check the per-question
-// timeout and unblock-window end at 1s granularity. The persistent main loop
-// performs the next enforcement pass when this returns.
+// End the normal poll cycle early when a SafeEyes work deadline falls within
+// it. This keeps the broad enforcement cadence at ~28s without delaying a
+// daemon-owned break by the remainder of that cadence.
+static time_t pause_cycle_deadline(time_t cycle_start,
+		time_t enforcement_deadline) {
+	time_t cycle_end = cycle_start + CYCLE_BUDGET;
+	if (enforcement_deadline > 0 && enforcement_deadline < cycle_end)
+		return enforcement_deadline;
+	return cycle_end;
+}
+
+// Run the pause poll loop for at most CYCLE_BUDGET seconds: keep the abstract
+// socket open, accept + verify + handle cb-pause clients, and check the
+// per-question timeout and unblock-window end at 1s granularity. If an active
+// SafeEyes work deadline is sooner, return at that deadline so the persistent
+// main loop immediately performs the break-enforcement pass.
 static void pause_run(struct passwd *pw, const char *ff_sync_sqlite,
-	const char *vv_leveldb, int dry, struct PauseState *st) {
+	const char *vv_leveldb, int dry, struct PauseState *st,
+	time_t enforcement_deadline) {
 	int sfd = pause_socket_setup();
 	if (sfd < 0) fprintf(stderr, "ChickenBlocker: pause socket setup failed\n");
 	time_t cycle_start = time(NULL);
+	time_t cycle_end = pause_cycle_deadline(cycle_start, enforcement_deadline);
 	int dirty = 0;
-	while (time(NULL) - cycle_start < CYCLE_BUDGET) {
+	while (time(NULL) < cycle_end) {
 		if (!dry) pause_recreate_binary();
 		if (sfd >= 0) {
 			fd_set rf; FD_ZERO(&rf); FD_SET(sfd, &rf);
@@ -2866,6 +2880,10 @@ static void pause_run(struct passwd *pw, const char *ff_sync_sqlite,
 				if (c >= 0) { dirty |= pause_handle_conn(c, pw, ff_sync_sqlite, dry, st); close(c); }
 			}
 		} else sleep(1);
+		if (time(NULL) >= cycle_end) {
+			if (dirty) write_state(st);
+			break;
+		}
 		enforce_vivaldi_managed_profile(pw, dry);
 		time_t now = time(NULL);
 		if (st->phase == 1) {
@@ -3305,10 +3323,12 @@ int main(void) {
 
 	// --- SafeEyes enforcement (auto-start, pomodoro/night block, calendar pause).
 	// Run every cycle under do_normal so it is skipped during a pause window.
+	time_t enforcement_deadline = 0;
 	if (do_normal) {
 		struct SafeEyesState se;
 		se_read_state(&se);
 		safeeyes_run(pw, dry, &se);
+		enforcement_deadline = se.se_work_end;
 		// Power button lock is break-scoped: night (always a break) or an
 		// active DAY break overlay (se_break_active; night never sets it).
 		time_t now_kb = time(NULL);
@@ -3324,7 +3344,22 @@ int main(void) {
 	if (st.phase == 2 && !dry) swap_unblocked(pw);
 
 	if (pause_dirty_init) write_state(&st);
-	pause_run(pw, ff_sync_sqlite, vv_leveldb, dry, &st);
+	pause_run(pw, ff_sync_sqlite, vv_leveldb, dry, &st,
+		enforcement_deadline);
+	// A deadline-shortened poll cycle must impose the break directly. Going
+	// around the outer loop first would put snap/browser enforcement ahead of
+	// SafeEyes again and could add several seconds of unrelated work.
+	if (do_normal && st.phase == 0 && enforcement_deadline > 0
+			&& time(NULL) >= enforcement_deadline) {
+		struct SafeEyesState se;
+		se_read_state(&se);
+		safeeyes_run(pw, dry, &se);
+		time_t now_kb = time(NULL);
+		struct tm tm_kb; localtime_r(&now_kb, &tm_kb);
+		de_killguard(pw, dry,
+			night_mode_active(&tm_kb) || se.se_break_active);
+		vt_night_guard(night_mode_active(&tm_kb), dry);
+	}
 
 	// Record the cycle's END wall-clock for fallback resume detection. The next
 	// pass starts immediately, so any long gap indicates suspend or clock reset.

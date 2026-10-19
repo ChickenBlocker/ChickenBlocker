@@ -156,6 +156,18 @@ int main(void) {
 	assert(se_cycle_after_break(1, 1) == 0);   // long break resets the count
 	assert(se_cycle_after_break(3, 1) == 0);
 
+	// The main poll loop normally runs for CYCLE_BUDGET, but a work deadline
+	// inside that window must wake the next enforcement pass at the deadline.
+	time_t cycle_start = 3000000;
+	assert(pause_cycle_deadline(cycle_start, 0)
+		== cycle_start + CYCLE_BUDGET);
+	assert(pause_cycle_deadline(cycle_start, cycle_start + 10)
+		== cycle_start + 10);
+	assert(pause_cycle_deadline(cycle_start, cycle_start + CYCLE_BUDGET + 5)
+		== cycle_start + CYCLE_BUDGET);
+	assert(pause_cycle_deadline(cycle_start, cycle_start - 1)
+		== cycle_start - 1);
+
 	puts("meeting state regressions: ok");
 	return 0;
 }
