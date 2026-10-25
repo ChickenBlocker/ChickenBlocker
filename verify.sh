@@ -11,6 +11,9 @@
 # and the ChickenBlocker services enabled/active.
 set -u
 
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+OSX_POLICY="$REPO_ROOT/../ChickenBlocker-OSX/AGENTS.md"
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -41,6 +44,9 @@ for p in \
   /etc/systemd/system/apparmor.service.d/override.conf ; do
   chk "lsattr \"\$p\" 2>/dev/null | cut -c1-22 | grep -q 'i'" "+i on $p"
 done
+if [ -f "$OSX_POLICY" ]; then
+  chk "lsattr \"$OSX_POLICY\" 2>/dev/null | cut -c1-22 | grep -q 'i'" "+i on $OSX_POLICY"
+fi
 for d in /opt/ChickenBlocker/bpf /etc/systemd/system/ChickenBlocker.target.wants ; do
   chk "lsattr -d \"\$d\" 2>/dev/null | cut -c1-22 | grep -q 'i'" "+i on dir $d"
 done

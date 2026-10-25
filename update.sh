@@ -35,6 +35,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BPF_DIR="$REPO_ROOT/bpf"
 AA_DIR="$REPO_ROOT/apparmor"
+OSX_REPO="$REPO_ROOT/../ChickenBlocker-OSX"
 UPDATER="$BPF_DIR/ChickenBlockUpd"
 MANIFEST=/run/ChickenBlocker-update-manifest
 SERVICE=ChickenBlocker-update.service
@@ -87,6 +88,14 @@ PROTECTED=(
   "/etc/apparmor.d/usr.bin.apparmor_parser|$AA_DIR/usr.bin.apparmor_parser"
   "/etc/apparmor.d/shell-bpf|$AA_DIR/shell-bpf"
 )
+
+# Keep the agent safety policy in the adjacent macOS repository immutable while
+# still allowing deliberate refreshes through this updater's protected channel.
+if [ -f "$OSX_REPO/AGENTS.md" ]; then
+  PROTECTED+=(
+    "$OSX_REPO/AGENTS.md|$REPO_ROOT/hardening/ChickenBlocker-OSX-AGENTS.md"
+  )
+fi
 
 # Non-protected (non-+i) source assets that install-core deploys. These are
 # plain copies root can do directly — no cap-endowed updater needed. Listed so
