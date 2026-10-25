@@ -40,9 +40,10 @@ tray_icon: typing.Optional["TrayIcon"] = None
 # built-in scheduler is neutered (huge intervals), so the times computed
 # from it would be nonsense ("next break in 7 days", "Interval 1/1"). The
 # daemon publishes the REAL schedule (next break, next long break, current
-# cycle X/4, night flag) to this file every ~30s cycle; the tray displays
-# that instead. If the file is missing or stale (daemon down), fall back to
-# the upstream computation.
+# cycle X/4, night flag) to this file every ~30s cycle via an atomic
+# rename; the tray watches it with a Gio.FileMonitor and refreshes on
+# every republish. If the file is missing or stale (daemon down), fall
+# back to the upstream computation.
 CB_SCHEDULE_FILE = "/tmp/cb_se_schedule"
 CB_SCHEDULE_STALE_SECS = 300
 
@@ -522,6 +523,8 @@ class TrayIcon:
 
     _resume_timeout_id: typing.Optional[int] = None
 
+    _cb_schedule_monitor: typing.Optional[Gio.FileMonitor] = None
+
     _session_bus: Gio.DBusConnection
 
     def __init__(self, context: Context, plugin_config):
@@ -558,6 +561,7 @@ class TrayIcon:
             on_secondary_activate=self.on_secondary_activate,
         )
         self.sni_service.register()
+        self._watch_daemon_schedule()
 
         self.update_tooltip()
 
@@ -566,27 +570,37 @@ class TrayIcon:
         self.plugin_config = plugin_config
         self.allow_disabling = plugin_config["allow_disabling"]
 
-        # VENDORED PATCH (ChickenBlocker): with the neutered scheduler the
-        # app itself never fires update_next_break, so refresh the displayed
-        # schedule from the daemon's file once a minute (guarded so a config
-        # reload does not stack timers).
-        if not getattr(self, "_cb_schedule_timer", False):
-            self._cb_schedule_timer = True
-            GLib.timeout_add_seconds(60, self._cb_daemon_schedule_tick)
-
         self.update_menu()
         self.update_tooltip()
 
-    def _cb_daemon_schedule_tick(self):
+    def _watch_daemon_schedule(self):
+        # The daemon-owned scheduler does not emit update_next_break, so
+        # watch its schedule file and refresh whenever the daemon
+        # republishes it (atomic rename each ~30s cycle). Works even while
+        # the file does not exist yet (watches the parent directory).
+        if self._cb_schedule_monitor is not None:
+            return
         try:
-            if _cb_read_daemon_schedule() is not None:
-                self.update_menu()
-                self.update_tooltip()
+            self._cb_schedule_monitor = Gio.File.new_for_path(
+                CB_SCHEDULE_FILE
+            ).monitor_file(Gio.FileMonitorFlags.NONE, None)
+            self._cb_schedule_monitor.connect(
+                "changed", self._on_daemon_schedule_changed
+            )
+        except Exception:
+            logging.exception("Failed to monitor the daemon schedule file")
+
+    def _on_daemon_schedule_changed(self, _monitor, _file, _other, _event):
+        try:
+            self.update_menu()
+            self.update_tooltip()
         except Exception:
             pass
-        return True  # keep the timer alive
 
     def unregister(self) -> None:
+        if self._cb_schedule_monitor is not None:
+            self._cb_schedule_monitor.cancel()
+            self._cb_schedule_monitor = None
         self.sni_service.unregister()
         self._session_bus.close_sync()
 

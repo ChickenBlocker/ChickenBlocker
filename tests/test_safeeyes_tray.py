@@ -130,6 +130,15 @@ class TrayDisplayTests(TestCase):
             self.assertIsNone(tray.TrayIcon.get_next_break_time(fake))
             self.assertIsNone(tray.TrayIcon.get_interval_progress(fake))
 
+    def test_monitor_event_refreshes_menu_and_tooltip(self):
+        # The Gio.FileMonitor "changed" handler must unconditionally refresh
+        # so a daemon republish is reflected without waiting for any event
+        # from SafeEyes itself.
+        fake = SimpleNamespace(update_menu=Mock(), update_tooltip=Mock())
+        tray.TrayIcon._on_daemon_schedule_changed(fake, None, None, None, None)
+        fake.update_menu.assert_called_once()
+        fake.update_tooltip.assert_called_once()
+
 
 if __name__ == "__main__":
     import unittest

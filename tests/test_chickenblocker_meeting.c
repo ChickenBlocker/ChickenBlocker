@@ -77,6 +77,9 @@ int main(void) {
 		"XDG_CONFIG_HOME", "/home/test/.config"));
 	assert(!nul_env_path_differs(env_normal, sizeof env_normal - 1,
 		"CHROME_USER_DATA_DIR", "/home/test/.config/vivaldi"));
+	char boot_id[37] = {0};
+	assert(boot_id_now(boot_id) == 0);
+	assert(strlen(boot_id) == 36);
 
 	struct SafeEyesState state = {0};
 	time_t before_day = local_time_at(2026, 9, 21, 7, 59);
@@ -91,6 +94,28 @@ int main(void) {
 	local_hour_for(hour_9, state.se_cal_hour);
 	assert(!calendar_sync_due(&state, hour_9));
 	assert(calendar_sync_due(&state, next_day));
+	struct SafeEyesState day_state = {0};
+	day_state.se_cycle = 3;
+	day_state.se_break_active = 1;
+	day_state.se_break_type = 1;
+	day_state.se_break_start = 123;
+	day_state.se_work_end = 456;
+	day_state.se_gate_start = 789;
+	day_state.se_work_left_at_gate = 100;
+	assert(se_begin_pomodoro_day(&day_state, "2026-09-21"));
+	assert(!strcmp(day_state.se_pomodoro_date, "2026-09-21"));
+	assert(day_state.se_cycle == 0);
+	assert(day_state.se_break_active == 0);
+	assert(day_state.se_break_type == -1);
+	assert(day_state.se_break_start == 0);
+	assert(day_state.se_work_end == 0);
+	assert(day_state.se_gate_start == 0);
+	assert(day_state.se_work_left_at_gate == -1);
+	day_state.se_cycle = 2;
+	assert(!se_begin_pomodoro_day(&day_state, "2026-09-21"));
+	assert(day_state.se_cycle == 2);
+	assert(se_begin_pomodoro_day(&day_state, "2026-09-22"));
+	assert(day_state.se_cycle == 0);
 
 	// Work-deadline adjustment on resume: suspend is NOT work time. A short
 	// sleep pauses the countdown (deadline pushed by the sleep duration,

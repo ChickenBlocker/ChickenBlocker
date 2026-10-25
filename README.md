@@ -55,6 +55,10 @@ dependencies. The daemon enforces SafeEyes as a second blocking surface:
   advances the cycle (a long one ends the 4-cycle set), and a fresh work
   interval starts after the Start-work gate - exactly like a scheduled one.
 - **Suspend semantics**:
+  - The first enforcement pass on each new local calendar day starts a fresh
+    pomodoro set at cycle 1/4. Work and cycle progress from the previous day
+    are discarded, so the first break cannot inherit yesterday's long-break
+    position, even after a daemon update or restart.
   - Sleeping mid-break consumes that break: on wake the daemon re-imposes
     only the time left, or considers it fully served if the sleep outlasted
     it (the overlay's own countdown is wall-clock based, so it also ends by

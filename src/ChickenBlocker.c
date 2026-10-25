@@ -626,6 +626,7 @@ struct SafeEyesState {
 	                      // break. The next imposed break is LONG iff
 	                      // se_cycle == 3 (the 4th); incremented when a break
 	                      // completes OR is skipped/satisfied by sleep.
+	char se_pomodoro_date[11]; // local YYYY-MM-DD owning the work/cycle state
 	time_t se_gate_start; // wall-clock when the cb_startwork "Start work"
 	                      // gate flag was first seen for the current gate
 	                      // (0 = no gate pending).
@@ -644,6 +645,8 @@ struct SafeEyesState {
 	                      // was frozen (not killed) by the kernel freezer and
 	                      // completed post-resume (which masks the wall-clock gap
 	                      // because se_last_cycle gets rewritten at resume time).
+	char se_boot_id[37];  // kernel boot ID for distinguishing a reboot from two
+	                      // boots with the same cumulative suspend duration.
 	unsigned long se_src_hash; // djb2 hash of the source config last seeded
 	int se_neutered;       // 0/1: the LIVE config was seeded with neutered
 	                       // scheduler intervals (SE_NEUTERED_INTERVAL). A
@@ -1053,11 +1056,13 @@ static int se_read_state(struct SafeEyesState *st) {
 	st->se_break_start = 0;
 	st->se_work_end = 0;
 	st->se_cycle = 0;
+	st->se_pomodoro_date[0] = 0;
 	st->se_gate_start = 0;
 	st->se_work_left_at_gate = -1;
 	st->se_last_cycle = 0;
 	st->se_boot_mono_valid = 0;
 	st->se_boot_mono = 0;
+	st->se_boot_id[0] = 0;
 	st->se_src_hash = 0;
 	st->se_neutered = 0;
 	st->se_cal_hour[0] = 0;
@@ -1082,11 +1087,13 @@ static int se_read_state(struct SafeEyesState *st) {
 		else if (!strcmp(line, "se_break_start")) st->se_break_start = (time_t)atoll(v);
 		else if (!strcmp(line, "se_work_end")) st->se_work_end = (time_t)atoll(v);
 		else if (!strcmp(line, "se_cycle")) st->se_cycle = atoi(v) & 3;
+		else if (!strcmp(line, "se_pomodoro_date")) snprintf(st->se_pomodoro_date, sizeof st->se_pomodoro_date, "%s", v);
 		else if (!strcmp(line, "se_gate_start")) st->se_gate_start = (time_t)atoll(v);
 		else if (!strcmp(line, "se_work_left_at_gate")) st->se_work_left_at_gate = atoll(v);
 		else if (!strcmp(line, "se_last_cycle")) st->se_last_cycle = (time_t)atoll(v);
 		else if (!strcmp(line, "se_boot_mono_valid")) st->se_boot_mono_valid = atoi(v);
 		else if (!strcmp(line, "se_boot_mono")) st->se_boot_mono = (time_t)atoll(v);
+		else if (!strcmp(line, "se_boot_id")) snprintf(st->se_boot_id, sizeof st->se_boot_id, "%s", v);
 		else if (!strcmp(line, "se_src_hash")) st->se_src_hash = strtoul(v, NULL, 10);
 		else if (!strcmp(line, "se_neutered")) st->se_neutered = atoi(v);
 		else if (!strcmp(line, "se_cal_hour")) snprintf(st->se_cal_hour, sizeof st->se_cal_hour, "%s", v);
@@ -1113,11 +1120,13 @@ static void se_write_state(const struct SafeEyesState *st) {
 	fprintf(f, "se_break_start=%lld\n", (long long)st->se_break_start);
 	fprintf(f, "se_work_end=%lld\n", (long long)st->se_work_end);
 	fprintf(f, "se_cycle=%d\n", st->se_cycle);
+	fprintf(f, "se_pomodoro_date=%s\n", st->se_pomodoro_date);
 	fprintf(f, "se_gate_start=%lld\n", (long long)st->se_gate_start);
 	fprintf(f, "se_work_left_at_gate=%lld\n", st->se_work_left_at_gate);
 	fprintf(f, "se_last_cycle=%lld\n", (long long)st->se_last_cycle);
 	fprintf(f, "se_boot_mono_valid=%d\n", st->se_boot_mono_valid);
 	fprintf(f, "se_boot_mono=%lld\n", (long long)st->se_boot_mono);
+	fprintf(f, "se_boot_id=%s\n", st->se_boot_id);
 	fprintf(f, "se_src_hash=%lu\n", st->se_src_hash);
 	fprintf(f, "se_neutered=%d\n", st->se_neutered);
 	fprintf(f, "se_cal_hour=%s\n", st->se_cal_hour);
@@ -1467,13 +1476,30 @@ static int se_cycle_after_break(int cycle, int was_long) {
 	return (cycle + 1) & 3;
 }
 
+static int se_begin_pomodoro_day(struct SafeEyesState *st, const char *today) {
+	if (strlen(today) != 10) return 0;
+	if (!strcmp(st->se_pomodoro_date, today)) return 0;
+	memcpy(st->se_pomodoro_date, today, 11);
+	st->se_break_active = 0;
+	st->se_break_type = -1;
+	st->se_break_start = 0;
+	st->se_work_end = 0;
+	st->se_cycle = 0;
+	st->se_gate_start = 0;
+	st->se_work_left_at_gate = -1;
+	return 1;
+}
+
 // Publish the REAL (daemon-owned) schedule for display: the vendored
 // SafeEyes tray icon reads this file each refresh and shows it
 // instead of its own (neutered, meaningless) scheduler times. Refreshed
 // every cycle; the tray treats it as stale after 5 minutes without an
 // update. next_break <= 0 means "not scheduled yet" (Start-work gate,
 // disarmed); interval 0 hides the X/4 line (night).
-// (Overridable so the test harness can publish to a scratch path.)
+// Written atomically (tmp file + rename) so a reader never sees a torn
+// file, and the rename itself is the event the tray's Gio.FileMonitor
+// refreshes on. (Overridable so the test harness can publish to a scratch
+// path.)
 #ifndef SE_SCHEDULE_FILE
 #define SE_SCHEDULE_FILE "/tmp/cb_se_schedule"
 #endif
@@ -1513,15 +1539,24 @@ static void se_write_schedule(const struct SafeEyesState *st,
 	// else: gate/disarmed -> next_break 0 (tray shows "waiting"), interval
 	// still shows where we are in the 4-cycle set.
 
-	FILE *f = fopen(SE_SCHEDULE_FILE, "w");
+	char tmp_path[sizeof(SE_SCHEDULE_FILE) + 8];
+	snprintf(tmp_path, sizeof tmp_path, "%s.tmp", SE_SCHEDULE_FILE);
+	FILE *f = fopen(tmp_path, "w");
 	if (!f) return;
 	fprintf(f, "night=%d\n", want_strict ? 1 : 0);
 	fprintf(f, "next_break=%lld\n", next_brk);
 	fprintf(f, "next_long=%lld\n", next_long);
 	fprintf(f, "interval=%d\n", interval);
 	fprintf(f, "total=4\n");
-	fclose(f);
-	chmod(SE_SCHEDULE_FILE, 0644);
+	if (fclose(f) != 0) {
+		unlink(tmp_path);
+		return;
+	}
+	chmod(tmp_path, 0644);
+	if (rename(tmp_path, SE_SCHEDULE_FILE) != 0) {
+		unlink(tmp_path);
+		return;
+	}
 }
 
 // Night block window: [00:00, 08:00). The start is pinned to midnight by
@@ -1546,6 +1581,20 @@ static int bootmono_now(time_t *value) {
 	if (d < 0) d = 0;
 	*value = (time_t)d;
 	return 0;
+}
+
+static int boot_id_now(char out[37]) {
+	FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
+	if (!f) return -1;
+	if (!fgets(out, 37, f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	size_t len = strlen(out);
+	while (len && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+		out[--len] = 0;
+	return len == 36 ? 0 : -1;
 }
 
 // djb2 hash of a file's contents. Used to detect when the SOURCE config
@@ -1842,17 +1891,31 @@ static void safeeyes_run(struct passwd *pw, int dry, struct SafeEyesState *st) {
 	//     the first cycle after Start would re-detect the same suspend and
 	//     misapply the skip rule to the just-armed work interval.
 	//
-	// (2) wall-clock gap (FALLBACK): used only when the boottime signal is
-	//     unavailable or reset by a reboot.
+	// (2) kernel boot ID + wall-clock gap: detects reboot reliably even when
+	//     two boots happen to have the same cumulative suspend duration.
+	//
+	// (3) wall-clock gap (FALLBACK): used when the boottime signal is
+	//     unavailable or reset and no definitive boot-ID transition exists.
 	int resumed = 0;
 	long long slept = 0;   // seconds spent suspended since the last cycle
 	time_t bm = 0;
 	int bm_available = (bootmono_now(&bm) == 0);
+	char boot_id[37] = {0};
+	int boot_id_available = (boot_id_now(boot_id) == 0);
+	int boot_id_needs_persist = boot_id_available
+		&& strcmp(boot_id, st->se_boot_id) != 0;
+	int rebooted = boot_id_available && st->se_boot_id[0]
+		&& boot_id_needs_persist;
 	time_t prev_bm = st->se_boot_mono;
 	int prev_bm_valid = st->se_boot_mono_valid;
 	long long suspend_secs = bm_available
 		? (long long)(bm - prev_bm) : 0;
-	if (bm_available && prev_bm_valid && suspend_secs > 2) {
+	if (rebooted && st->se_last_cycle != 0) {
+		slept = (long long)(now - st->se_last_cycle);
+		if (slept < 0) slept = 0;
+		resumed = 1;
+		printf("SAFEEYES: reboot detected (offline %llds)\n", slept);
+	} else if (bm_available && prev_bm_valid && suspend_secs > 2) {
 		resumed = 1;
 		slept = suspend_secs;
 		printf("SAFEEYES: resume detected (suspend %llds)\n", suspend_secs);
@@ -1867,8 +1930,12 @@ static void safeeyes_run(struct passwd *pw, int dry, struct SafeEyesState *st) {
 	if (bm_available) {
 		st->se_boot_mono = bm;
 		st->se_boot_mono_valid = 1;
-		if (!dry && (!prev_bm_valid || bm != prev_bm)) se_write_state(st);
 	}
+	if (boot_id_available)
+		snprintf(st->se_boot_id, sizeof st->se_boot_id, "%s", boot_id);
+	if (!dry && ((!prev_bm_valid && bm_available)
+			|| (bm_available && bm != prev_bm) || boot_id_needs_persist))
+		se_write_state(st);
 	int rt_fallback = (!bm_available
 		|| (prev_bm_valid && bm_available && bm < prev_bm));
 	if (!resumed && rt_fallback && st->se_last_cycle != 0) {
@@ -1878,6 +1945,17 @@ static void safeeyes_run(struct passwd *pw, int dry, struct SafeEyesState *st) {
 			slept = rtgap;
 			printf("SAFEEYES: resume detected (rt gap %llds)\n", rtgap);
 		}
+	}
+
+	// Calendar ownership is persisted independently of resume detection. This
+	// also resets stale state when the daemon was updated/restarted after the
+	// wake was already processed by an older version.
+	char pomodoro_today[16];
+	local_date_for(now, pomodoro_today);
+	if (!dry && se_begin_pomodoro_day(st, pomodoro_today)) {
+		printf("SAFEEYES: starting pomodoro day %s at cycle 1/4\n",
+			pomodoro_today);
+		se_write_state(st);
 	}
 
 	// --- Start-work gate ----------------------------------------------------
