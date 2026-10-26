@@ -888,9 +888,9 @@ static int copy_file_user(const char *src, const char *dst, struct passwd *pw) {
 //     connection, so SafeEyes dies via its X-error/exit() path.
 //   * <Primary><Shift>Escape opens xfce4-taskmanager, which can SIGKILL/
 //     SIGSTOP safeeyes from its window list.
-//   * whisker-menu / panel "Log Out" exec xfce4-session-logout; ending the
-//     session tears safeeyes down with it (the daemon relaunches it, but the
-//     overlay blinks out for ~30s and reappears over the greeter).
+//   * whisker-menu / panel "Log Out" exec xfce4-session-logout; during a break,
+//     ending the session tears safeeyes down with it (the daemon relaunches it,
+//     but the overlay blinks out for ~30s and reappears over the greeter).
 // Counters, re-asserted each cycle (re-applied within ~30s if re-added or an
 // apt upgrade restores a binary mode):
 //   1. chmod 0000 the launcher binaries (root's access() X_OK probe succeeds
@@ -901,8 +901,9 @@ static int copy_file_user(const char *src, const char *dst, struct passwd *pw) {
 static const char *const killguard_binaries[] = {
 	"/usr/bin/xkill",                 // Ctrl+Alt+Esc kill cursor
 	"/usr/bin/xfce4-taskmanager",     // Ctrl+Alt+Shift+Esc / menu: SIGKILL UI
-	"/usr/bin/xfce4-session-logout",  // whisker-menu / panel Log Out
 };
+
+static const char *const session_logout = "/usr/bin/xfce4-session-logout";
 
 static const char *const killguard_bindings[] = {
 	"/commands/custom/<Primary><Alt>Escape",     // -> xkill
@@ -922,6 +923,23 @@ static void de_killguard(struct passwd *pw, int dry, int lock_power) {
 			printf("KILLGUARD: %s disabled (mode 0000)\n", path);
 		} else {
 			printf("KILLGUARD: chmod %s failed: %s\n", path, strerror(errno));
+		}
+	}
+	// Keep the panel's shutdown/restart dialog available during work, but deny
+	// its launcher while a SafeEyes break (including the night break) is active.
+	struct stat logout_st;
+	mode_t logout_mode = lock_power ? 0000 : 0755;
+	if (stat(session_logout, &logout_st) == 0
+			&& (logout_st.st_mode & 07777) != logout_mode) {
+		if (dry) {
+			printf("KILLGUARD: would chmod %04o %s\n",
+				(unsigned)logout_mode, session_logout);
+		} else if (chmod(session_logout, logout_mode) == 0) {
+			printf("KILLGUARD: %s mode set to %04o\n",
+				session_logout, (unsigned)logout_mode);
+		} else {
+			printf("KILLGUARD: chmod %s failed: %s\n",
+				session_logout, strerror(errno));
 		}
 	}
 	if (dry) {
