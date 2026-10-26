@@ -244,6 +244,14 @@ class BreakQueue:
             break_obj = self.__next_long()
         elif longs is None:
             break_obj = self.__next_short()
+        # VENDORED PATCH (ChickenBlocker): explicit type requests must win in
+        # both directions. Upstream only special-cased LONG, so next(SHORT)
+        # could still select LONG when its interval was <= the short interval.
+        # ChickenBlocker deliberately neuters both scheduler intervals to the
+        # same value, making every daemon-aligned manual SHORT request repeat
+        # a LONG break without this symmetric check.
+        elif break_type == BreakType.SHORT_BREAK:
+            break_obj = self.__next_short()
         elif (
             break_type == BreakType.LONG_BREAK
             or longs[self.__current_long].time <= shorts[self.__current_short].time

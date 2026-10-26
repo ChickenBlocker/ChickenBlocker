@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor"))
 
 from safeeyes.core import SafeEyesCore  # noqa: E402
-from safeeyes.model import State  # noqa: E402
+from safeeyes.model import Break, BreakQueue, BreakType, State  # noqa: E402
 from safeeyes import utility  # noqa: E402
 
 
@@ -77,6 +77,29 @@ class TakeBreakNotArmedTests(TestCase):
         result = SafeEyesCore.take_break(core)
 
         self.assertTrue(result)
+
+
+class ExplicitBreakTypeTests(TestCase):
+    def _equal_interval_queue(self):
+        context = SimpleNamespace(session={}, ext={})
+        short = Break(BreakType.SHORT_BREAK, "short", 10080, 300, None, {})
+        long = Break(BreakType.LONG_BREAK, "long", 10080, 1800, None, {})
+        return BreakQueue(context, 10080, 10080, False, [short], [long])
+
+    def test_explicit_short_wins_when_neutered_intervals_are_equal(self):
+        queue = self._equal_interval_queue()
+        self.assertEqual(queue.get_break().type, BreakType.LONG_BREAK)
+
+        selected = queue.next(BreakType.SHORT_BREAK)
+
+        self.assertEqual(selected.type, BreakType.SHORT_BREAK)
+
+    def test_explicit_long_remains_long(self):
+        queue = self._equal_interval_queue()
+
+        selected = queue.next(BreakType.LONG_BREAK)
+
+        self.assertEqual(selected.type, BreakType.LONG_BREAK)
 
 
 class DoPreBreakStoppedCoreTests(TestCase):

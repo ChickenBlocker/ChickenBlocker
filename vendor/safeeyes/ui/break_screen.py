@@ -17,8 +17,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import json
 import logging
 import os
+import subprocess
 import time
 import typing
 
@@ -86,6 +88,125 @@ _SCREEN_LOCKER_WM_CLASSES = frozenset(
     }
 )
 
+# VENDORED PATCH (ChickenBlocker): XFCE shortcuts which can expose another
+# window or the application menu over an X11 break screen.  Do not use an
+# active XGrabKeyboard here: that prevents the screen saver from acquiring the
+# keyboard when the idle timeout expires.  Temporarily disabling these narrow
+# bindings leaves idle detection, locking and suspend unaffected.
+_XFCE_BREAK_SHORTCUTS = (
+    ("xfce4-keyboard-shortcuts", "/xfwm4/custom/<Alt>Tab"),
+    ("xfce4-keyboard-shortcuts", "/xfwm4/custom/<Alt><Shift>Tab"),
+    ("xfce4-keyboard-shortcuts", "/commands/custom/Super_L"),
+    ("xfce4-keyboard-shortcuts", "/commands/custom/Super_R"),
+)
+
+
+def _shortcut_state_path() -> str:
+    return os.path.expanduser("~/.config/safeeyes/x11-shortcuts.json")
+
+
+def _run_xfconf(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["xfconf-query", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+
+
+def _disabled_shortcut_value(prop: str) -> str:
+    # xfsettingsd treats an empty command binding as a launch failure and
+    # displays "Failed to call shortcut Super_L". A successful no-op consumes
+    # standalone Super without producing that notification. XFWM action
+    # bindings, in contrast, are disabled with an empty action name.
+    if prop.startswith("/commands/"):
+        return "/usr/bin/true"
+    return ""
+
+
+def _restore_xfce_break_shortcuts() -> None:
+    """Restore bindings left disabled by this or a crashed Safe Eyes run."""
+    state_path = _shortcut_state_path()
+    try:
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            saved = json.load(state_file)
+    except (OSError, ValueError, TypeError):
+        return
+
+    expected = set(_XFCE_BREAK_SHORTCUTS)
+    restored = True
+    for item in saved:
+        try:
+            channel = item["channel"]
+            prop = item["property"]
+            existed = item["existed"]
+            value = item.get("value", "")
+        except (KeyError, TypeError):
+            restored = False
+            continue
+        if (channel, prop) not in expected or not isinstance(value, str):
+            restored = False
+            continue
+        try:
+            if existed:
+                result = _run_xfconf("-c", channel, "-p", prop, "-s", value)
+            else:
+                result = _run_xfconf("-c", channel, "-p", prop, "-r")
+            restored = restored and result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            restored = False
+
+    if restored:
+        try:
+            os.unlink(state_path)
+        except FileNotFoundError:
+            pass
+
+
+def _disable_xfce_break_shortcuts() -> bool:
+    """Disable only Alt-Tab and the two standalone Super menu bindings."""
+    state_path = _shortcut_state_path()
+    if os.path.exists(state_path):
+        # A live instance calls this only once.  An existing record therefore
+        # belongs to a prior crashed run and must be repaired first.
+        _restore_xfce_break_shortcuts()
+        if os.path.exists(state_path):
+            return False
+
+    saved = []
+    try:
+        for channel, prop in _XFCE_BREAK_SHORTCUTS:
+            result = _run_xfconf("-c", channel, "-p", prop)
+            saved.append(
+                {
+                    "channel": channel,
+                    "property": prop,
+                    "existed": result.returncode == 0,
+                    "value": result.stdout.rstrip("\n") if result.returncode == 0 else "",
+                }
+            )
+
+        os.makedirs(os.path.dirname(state_path), mode=0o700, exist_ok=True)
+        temporary = state_path + ".tmp-{}".format(os.getpid())
+        with open(temporary, "w", encoding="utf-8") as state_file:
+            json.dump(saved, state_file)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, state_path)
+
+        for channel, prop in _XFCE_BREAK_SHORTCUTS:
+            result = _run_xfconf(
+                "-c", channel, "-p", prop, "-s", _disabled_shortcut_value(prop)
+            )
+            if result.returncode != 0:
+                raise RuntimeError("xfconf rejected shortcut update")
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        logging.exception("Could not disable XFCE break shortcuts")
+        _restore_xfce_break_shortcuts()
+        return False
+    return True
+
 
 def _read_x11_property(window, atom):
     """Read a full X11 property from a window.
@@ -146,6 +267,12 @@ class BreakScreen:
         self._own_xids_x11 = set()
         self._foreign_fs_failures = 0
         self._foreign_fs_last_recovery = 0.0
+        self._xfce_shortcuts_suspended = False
+
+        # Recover exact bindings after SIGKILL, a crash or a reboot during a
+        # break. Normal break teardown removes this recovery record.
+        if not self.context.is_wayland and os.path.exists(_shortcut_state_path()):
+            _restore_xfce_break_shortcuts()
 
     def initialize(self, config: Config) -> None:
         """Initialize the internal properties from configuration."""
@@ -226,6 +353,9 @@ class BreakScreen:
 
         # Destroy other windows if exists
         self.__destroy_all_screens()
+        if self._xfce_shortcuts_suspended:
+            _restore_xfce_break_shortcuts()
+            self._xfce_shortcuts_suspended = False
 
     def __show_break_screen(
         self,
@@ -235,6 +365,12 @@ class BreakScreen:
         tray_actions: list[TrayAction],
     ) -> None:
         """Show an empty break screen on all screens."""
+        # ChickenBlocker launches Safe Eyes from a system service, so desktop
+        # identification variables are intentionally absent. Probe xfconf
+        # directly instead of relying on context.desktop == "xfce".
+        if not self.context.is_wayland and not self._xfce_shortcuts_suspended:
+            self._xfce_shortcuts_suspended = _disable_xfce_break_shortcuts()
+
         # Lock the keyboard
         if not self.context.is_wayland:
             utility.start_thread(self.__lock_keyboard_x11)
@@ -324,9 +460,9 @@ class BreakScreen:
 
             i = i + 1
 
-        # VENDORED PATCH (ChickenBlocker): enforce the break layer against
-        # OTHER applications that become fullscreen while the break is
-        # running (X11 only; see __start_foreign_fullscreen_watch_x11).
+        # VENDORED PATCH (ChickenBlocker): enforce the break layer and keyboard
+        # focus against OTHER applications while the break is running (X11
+        # only; see __start_foreign_fullscreen_watch_x11).
         if not self.context.is_wayland:
             self.__start_foreign_fullscreen_watch_x11()
 
@@ -404,15 +540,16 @@ class BreakScreen:
         return xids
 
     def __start_foreign_fullscreen_watch_x11(self) -> None:
-        """VENDORED PATCH (ChickenBlocker): re-raise the break screens when
-        another application becomes fullscreen during a break.
+        """VENDORED PATCH (ChickenBlocker): reclaim the break screen when
+        another application receives focus during a break.
 
-        xfwm4 stacks a newly fullscreened foreign window above the break
-        screens even though they carry _NET_WM_STATE_ABOVE/STICKY. A single
-        low-frequency GLib timer polls the EWMH state of the active window
-        and restores the break layer when that happens. It never raises the
-        break screens over a screen locker (see _SCREEN_LOCKER_WM_CLASSES),
-        ignores ordinary focus changes, and never runs on Wayland.
+        Merely drawing the overlay above other windows does not route keyboard
+        input to it: Alt-Tab can leave a visually hidden terminal focused. A
+        low-frequency GLib timer therefore polls the EWMH active window and
+        presents the break window again if an ordinary application acquired
+        focus. This is normal focus management, not XGrabKeyboard, so a screen
+        locker can still grab input and suspend normally. Known screen lockers
+        are explicitly exempted. The watcher never runs on Wayland.
         """
         if self.x11_display is None:
             return
@@ -449,7 +586,7 @@ class BreakScreen:
         except Exception:
             # All expected races are handled inside the check; an exception
             # here means the display is gone (session/VT teardown): stop.
-            logging.exception("Foreign fullscreen check failed")
+            logging.exception("Foreign active-window check failed")
             self._foreign_fs_timer = None
             return False
         self._own_xids_x11 = own_xids
@@ -461,12 +598,12 @@ class BreakScreen:
         return True
 
     def __recover_break_screens_x11(self) -> None:
-        """Restore the break screens above a foreign fullscreen window."""
+        """Restore focus and stacking over a foreign application window."""
         if self._foreign_fs_failures >= 5:
             # The WM keeps the foreign window above us (or we are in a
             # lock/suspend/VT transition): stand down instead of fighting
             # in a tight loop. Re-arms automatically once the active window
-            # is no longer a foreign fullscreen window.
+            # is no longer the active foreign window.
             return
         now = time.monotonic()
         if now - self._foreign_fs_last_recovery < 1.0:
@@ -475,14 +612,13 @@ class BreakScreen:
         self._foreign_fs_failures += 1
         if self._foreign_fs_failures == 1:
             logging.info(
-                "Another application became fullscreen during the break; "
-                "restoring the break screen(s)"
+                "Another application received focus during the break; "
+                "restoring break-screen focus"
             )
         elif self._foreign_fs_failures >= 5:
             logging.info(
-                "Break screen(s) not kept above the foreign fullscreen "
-                "window after %d attempts; standing down until focus or "
-                "fullscreen state changes",
+                "Break screen focus not restored after %d attempts; standing "
+                "down until the active window changes",
                 self._foreign_fs_failures,
             )
         for window in list(self.windows):
@@ -496,19 +632,16 @@ class BreakScreen:
                 self.__window_set_keep_above_x11(window)
             except Exception:
                 logging.exception(
-                    "Failed to restore a break screen over a foreign "
-                    "fullscreen window"
+                    "Failed to restore break-screen focus over another window"
                 )
 
     @staticmethod
     def _check_foreign_fullscreen_x11(display, own_xids: set) -> bool:
-        """Decide whether the break screens must be re-raised over the
-        currently active window (X11 only).
+        """Decide whether break-screen focus must be reclaimed (X11 only).
 
-        Returns True only when the active window is a foreign (non Safe
-        Eyes) window that currently has _NET_WM_STATE_FULLSCREEN and is not
-        one of the known screen lockers. Property read failures (destroyed
-        windows etc.) are benign races and return False.
+        Returns True when the active window is a foreign (non Safe Eyes)
+        application that is not a known screen locker. Property read failures
+        (destroyed windows etc.) are benign races and return False.
         """
         try:
             root = display.screen().root
@@ -530,17 +663,6 @@ class BreakScreen:
             )
         except Exception:
             # The active window died between the two reads: benign race.
-            return False
-
-        state_prop, ok = _read_x11_property(
-            active_window, display.intern_atom("_NET_WM_STATE")
-        )
-        if not ok:
-            return False
-        if not BreakScreen._state_atoms_contain_fullscreen(
-            state_prop, display.intern_atom("_NET_WM_STATE_FULLSCREEN")
-        ):
-            # Ordinary focus change (Alt-Tab etc.): must not raise anything.
             return False
 
         class_prop, ok = _read_x11_property(
@@ -609,15 +731,12 @@ class BreakScreen:
         VENDORED PATCH (ChickenBlocker): keyboard grab removed. An active X
         keyboard grab blocks the screen locker (xfce4-screensaver /
         light-locker / xflock4) from grabbing the keyboard, so the idle
-        screen lock never fires while a break window is shown. The break
-        screen still covers the whole screen (fullscreen + set_focus(None))
-        and stays on top via _NET_WM_STATE_ABOVE + STICKY
-        (__window_set_keep_above_x11), so the user cannot actually interact
-        with other windows even though input focus may move. Skip/postpone
-        shortcuts are disabled in this setup anyway (strict_break + shortcut
-        keys = 0), so losing the grab loses nothing. self.lock_keyboard is
-        kept False so __release_keyboard_x11 (which only sets it False) is a
-        harmless no-op.
+        screen lock never fires while a break window is shown. Instead, the
+        active-window watcher above reclaims ordinary focus while exempting
+        screen lockers, and the XFCE bindings for switching away are disabled
+        for the break. Skip/postpone shortcuts are disabled in this setup
+        anyway (strict_break + shortcut keys = 0). self.lock_keyboard is kept
+        False so __release_keyboard_x11 is a harmless no-op.
         """
         self.lock_keyboard = False
         return

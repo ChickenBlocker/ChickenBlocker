@@ -178,7 +178,7 @@ class ForeignFullscreenDecisionTests(TestCase):
         display._root.active_xid = None
         self.assertFalse(_check(display))
 
-    def test_ordinary_foreign_window_no_recovery(self):
+    def test_ordinary_foreign_window_requests_focus_recovery(self):
         display = FakeDisplay(
             FOREIGN_XID,
             FakeWindow(
@@ -186,11 +186,11 @@ class ForeignFullscreenDecisionTests(TestCase):
                 wm_class=FIREFOX_CLASS,
             ),
         )
-        self.assertFalse(_check(display))
+        self.assertTrue(_check(display))
 
-    def test_foreign_window_without_wm_state_no_recovery(self):
+    def test_foreign_window_without_wm_state_requests_focus_recovery(self):
         display = FakeDisplay(FOREIGN_XID, FakeWindow(state_atoms=None))
-        self.assertFalse(_check(display))
+        self.assertTrue(_check(display))
 
     def test_foreign_fullscreen_application_requests_recovery(self):
         display = FakeDisplay(
@@ -205,21 +205,19 @@ class ForeignFullscreenDecisionTests(TestCase):
         )
         self.assertTrue(_check(display))
 
-    def test_known_screen_locker_fullscreen_no_recovery(self):
+    def test_known_screen_locker_never_requests_focus_recovery(self):
         for locker in ("xfce4-screensaver", "light-locker", "i3lock", "xsecurelock"):
-            display = FakeDisplay(
-                FOREIGN_XID,
-                FakeWindow(
-                    state_atoms=(FULLSCREEN,),
-                    wm_class=("%s\x00%s" % (locker, locker)).encode("ascii"),
-                ),
-            )
-            self.assertFalse(_check(display), locker)
+            for state_atoms in ((), (FULLSCREEN,)):
+                display = FakeDisplay(
+                    FOREIGN_XID,
+                    FakeWindow(
+                        state_atoms=state_atoms,
+                        wm_class=("%s\x00%s" % (locker, locker)).encode("ascii"),
+                    ),
+                )
+                self.assertFalse(_check(display), locker)
 
     def test_destroyed_foreign_window_is_benign_race(self):
-        display = FakeDisplay(FOREIGN_XID, FakeWindow(state_error=True))
-        self.assertFalse(_check(display))
-
         display = FakeDisplay(
             FOREIGN_XID, FakeWindow(state_atoms=(FULLSCREEN,), class_error=True)
         )

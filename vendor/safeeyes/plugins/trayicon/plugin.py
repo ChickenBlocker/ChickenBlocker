@@ -903,7 +903,27 @@ class TrayIcon:
         return (current_interval, total_intervals)
 
     def on_manual_break_clicked(self, break_type):
-        """Trigger a break manually."""
+        """Trigger a break manually.
+
+        VENDORED PATCH (ChickenBlocker): the daemon owns the cycle. Safe Eyes'
+        scheduler intervals are both neutered to 7 days, so its internal queue
+        can select LONG again immediately after a long break (equal intervals
+        make LONG win). For the generic action, use the daemon's published
+        cycle: interval 4/4 is long; all earlier intervals are short.
+        """
+        if break_type is None:
+            schedule = _cb_read_daemon_schedule()
+            if schedule is not None:
+                interval = schedule.get("interval")
+                total = schedule.get("total")
+                if schedule.get("night"):
+                    break_type = BreakType.LONG_BREAK
+                elif interval is not None and total is not None:
+                    break_type = (
+                        BreakType.LONG_BREAK
+                        if interval == total
+                        else BreakType.SHORT_BREAK
+                    )
         self.take_break(break_type)
 
     def on_secondary_activate(self) -> None:

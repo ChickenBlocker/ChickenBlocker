@@ -140,6 +140,46 @@ class TrayDisplayTests(TestCase):
         fake.update_tooltip.assert_called_once()
 
 
+class ManualBreakTests(TestCase):
+    def test_after_long_cycle_manual_break_uses_next_short_cycle(self):
+        fake = SimpleNamespace(take_break=Mock())
+        with _TmpSchedule(
+            "night=0\nnext_break=100\nnext_long=400\ninterval=1\ntotal=4\n"
+        ):
+            tray.TrayIcon.on_manual_break_clicked(fake, None)
+
+        fake.take_break.assert_called_once_with(tray.BreakType.SHORT_BREAK)
+
+    def test_manual_break_is_long_when_fourth_cycle_is_next(self):
+        fake = SimpleNamespace(take_break=Mock())
+        with _TmpSchedule(
+            "night=0\nnext_break=100\nnext_long=100\ninterval=4\ntotal=4\n"
+        ):
+            tray.TrayIcon.on_manual_break_clicked(fake, None)
+
+        fake.take_break.assert_called_once_with(tray.BreakType.LONG_BREAK)
+
+    def test_explicit_type_is_preserved(self):
+        fake = SimpleNamespace(take_break=Mock())
+        with _TmpSchedule(
+            "night=0\nnext_break=100\nnext_long=400\ninterval=1\ntotal=4\n"
+        ):
+            tray.TrayIcon.on_manual_break_clicked(fake, tray.BreakType.LONG_BREAK)
+
+        fake.take_break.assert_called_once_with(tray.BreakType.LONG_BREAK)
+
+    def test_missing_daemon_schedule_falls_back_to_safeeyes_queue(self):
+        fake = SimpleNamespace(take_break=Mock())
+        saved = tray.CB_SCHEDULE_FILE
+        tray.CB_SCHEDULE_FILE = "/tmp/definitely-not-here-cb-manual-schedule"
+        try:
+            tray.TrayIcon.on_manual_break_clicked(fake, None)
+        finally:
+            tray.CB_SCHEDULE_FILE = saved
+
+        fake.take_break.assert_called_once_with(None)
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()
