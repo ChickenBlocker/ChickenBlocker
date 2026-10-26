@@ -10,3 +10,4 @@ __pycache__
 # via AMO on each version bump.
 /cb_keyword_block/web-ext-artifacts/
 /cb_keyword_block/.amo-upload-uuid
+/tests/test_chickenblocker_meeting
