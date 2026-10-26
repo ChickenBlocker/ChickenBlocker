@@ -171,6 +171,7 @@ def _setup_suspend_listener():
                 return
             (sleeping,) = params
             if not sleeping:
+                _request_daemon_refresh()
                 GLib.idle_add(_on_resume_while_gating)
 
         proxy.connect("g-signal", _on_signal)
@@ -585,12 +586,14 @@ def on_countdown(countdown, seconds):
 
 
 STARTWORK_FLAG = "/tmp/cb_startwork_dialog"
+DAEMON_REFRESH_FLAG = "/tmp/cb_safeeyes_refresh"
 
 
 def _set_flag():
     try:
         with open(STARTWORK_FLAG, "w") as f:
             f.write("1")
+        _request_daemon_refresh()
     except Exception:
         pass
 
@@ -600,6 +603,19 @@ def _clear_flag():
         os.remove(STARTWORK_FLAG)
     except Exception:
         pass
+
+
+def _request_daemon_refresh():
+    """Wake ChickenBlocker's enforcement loop after Start/resume."""
+    try:
+        fd = os.open(
+            DAEMON_REFRESH_FLAG,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.close(fd)
+    except OSError as error:
+        _log_decision("daemon_refresh_failed", error=str(error))
 
 
 def on_stop_break():
@@ -740,12 +756,13 @@ def _on_start_clicked(_widget):
     global _dialog, _idle_gated
     # VENDORED CHANGE (ChickenBlocker): always a FRESH core.start(). The
     # daemon owns work-interval timing: when _clear_flag() removes the
-    # sentinel, its next cycle arms the work deadline (fresh, or the preserved
-    # remainder if the gate was held only briefly). No remainder is restored
-    # here -- the scheduler being restarted is neutered and must never fire a
-    # natural break.
+    # sentinel, the refresh request below wakes its poll loop and arms the work
+    # deadline (fresh, or the preserved remainder if the gate was held only
+    # briefly). No remainder is restored here -- the scheduler being restarted
+    # is neutered and must never fire a natural break.
     _log_decision("start_pressed; resuming core")
     _clear_flag()
+    _request_daemon_refresh()
     _idle_gated = False
     if _dialog is not None:
         d = _dialog

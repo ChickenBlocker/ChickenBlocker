@@ -39,6 +39,14 @@ gi.require_version("GLib", "2.0")
 from gi.repository import GLib
 
 
+_CHICKENBLOCKER_MIN_NATURAL_WAIT_SECONDS = 7 * 24 * 60 * 60
+
+
+def _natural_wait_seconds(configured_minutes: int) -> int:
+    """Keep Safe Eyes' scheduler dormant; ChickenBlocker owns deadlines."""
+    return max(configured_minutes * 60, _CHICKENBLOCKER_MIN_NATURAL_WAIT_SECONDS)
+
+
 class SafeEyesCore:
     """Core of Safe Eyes runs the scheduler and notifies the breaks."""
 
@@ -314,7 +322,11 @@ class SafeEyesCore:
             self.scheduled_next_break_timestamp = -1
         else:
             # Use next break, convert to seconds
-            time_to_wait = self._break_queue.get_break().time * 60
+            # Persisted/in-memory queue times can predate the neutered config
+            # or be reduced while handling a manual break. Never let that queue
+            # fire naturally; daemon impose requests wake this wait when the
+            # authoritative deadline arrives.
+            time_to_wait = _natural_wait_seconds(self._break_queue.get_break().time)
 
         self.scheduled_next_break_time = current_time + datetime.timedelta(
             seconds=time_to_wait

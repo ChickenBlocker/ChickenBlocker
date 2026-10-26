@@ -67,10 +67,18 @@ def _wnck_break_windows():
 def _classify():
     # Returns "BREAK_SHORT", "BREAK_LONG", or "BREAK" (unknown type).
     try:
-        cfg = json.load(open(CONFIG_PATH))
-        sess = json.load(open(SESSION_PATH))
+        with open(CONFIG_PATH, encoding="utf-8") as config_file:
+            cfg = json.load(config_file)
+        with open(SESSION_PATH, encoding="utf-8") as session_file:
+            sess = json.load(session_file)
     except Exception:
         return "BREAK"
+    active_type = sess.get("active_break_type")
+    if active_type == "short":
+        return "BREAK_SHORT"
+    if active_type == "long":
+        return "BREAK_LONG"
+
     cur = (sess.get("break") or "").strip()
     if not cur:
         return "BREAK"

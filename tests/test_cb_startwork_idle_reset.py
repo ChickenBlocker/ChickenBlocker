@@ -31,6 +31,8 @@ class StartFreshTests(TestCase):
         self._clear_flag = cb_startwork._clear_flag
         cb_startwork._clear_flag = Mock()
         self._set_flag = cb_startwork._set_flag
+        self._request_daemon_refresh = cb_startwork._request_daemon_refresh
+        cb_startwork._request_daemon_refresh = Mock()
         cb_startwork.core = SimpleNamespace(running=False, start=Mock(), stop=Mock())
         cb_startwork._dialog = Mock()
 
@@ -38,6 +40,7 @@ class StartFreshTests(TestCase):
         cb_startwork._log.handlers = self._handlers
         cb_startwork._clear_flag = self._clear_flag
         cb_startwork._set_flag = self._set_flag
+        cb_startwork._request_daemon_refresh = self._request_daemon_refresh
         cb_startwork.core = None
         cb_startwork._dialog = None
         cb_startwork._idle_gated = False
@@ -71,6 +74,7 @@ class StartFreshTests(TestCase):
         cb_startwork._on_start_clicked(None)
 
         cb_startwork._clear_flag.assert_called_once()
+        cb_startwork._request_daemon_refresh.assert_called_once()
         self.assertFalse(cb_startwork._idle_gated)
         self.assertIsNone(cb_startwork._dialog)
 

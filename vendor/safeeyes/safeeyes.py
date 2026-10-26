@@ -669,6 +669,14 @@ class SafeEyes(Gtk.Application):
         """Pass the break information to plugins."""
         if not self.plugins_manager.start_break(break_obj):
             return False
+        # Persist the break actually entering the overlay. The ordinary
+        # "break" field describes the queue and can lag a manual selection or
+        # advance to the following entry before an external observer reads it.
+        self.context["session"]["active_break_type"] = (
+            "long" if break_obj.is_long_break() else "short"
+        )
+        if self.config.get("persist_state"):
+            utility.write_json(utility.SESSION_FILE_PATH, self.context["session"])
         return True
 
     def start_break(self, break_obj):
@@ -695,6 +703,9 @@ class SafeEyes(Gtk.Application):
         """Stop the current break."""
         self.break_screen.close()
         self.plugins_manager.stop_break()
+        self.context["session"].pop("active_break_type", None)
+        if self.config.get("persist_state"):
+            utility.write_json(utility.SESSION_FILE_PATH, self.context["session"])
         return True
 
     def take_break(self, break_type: typing.Optional[BreakType] = None) -> bool:

@@ -1,5 +1,6 @@
 #define CHICKENBLOCKER_TEST
 #define SE_SCHEDULE_FILE "/tmp/kilo_cb_se_schedule_test"
+#define SE_REFRESH_FILE "/tmp/kilo_cb_safeeyes_refresh_test"
 #include "../src/ChickenBlocker.c"
 
 #include <assert.h>
@@ -16,6 +17,16 @@ static time_t local_time_at(int year, int month, int day, int hour, int minute) 
 }
 
 int main(void) {
+	unlink(SE_REFRESH_FILE);
+	assert(!se_refresh_requested(1));
+	FILE *refresh = fopen(SE_REFRESH_FILE, "w");
+	assert(refresh != NULL);
+	fclose(refresh);
+	assert(se_refresh_requested(0));
+	assert(access(SE_REFRESH_FILE, F_OK) == 0);
+	assert(se_refresh_requested(1));
+	assert(access(SE_REFRESH_FILE, F_OK) != 0);
+
 	const char *id =
 		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 	char line[256];

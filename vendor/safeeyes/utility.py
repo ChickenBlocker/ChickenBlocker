@@ -152,14 +152,16 @@ def system_locale(category=locale.LC_MESSAGES):
 
 
 def format_time(time):
-    """Format time based on the system time."""
+    """Format time using a 24-hour clock."""
+    # VENDORED PATCH (ChickenBlocker): keep tray/menu times unambiguous and
+    # independent of whether the current locale defaults to a 12-hour clock.
     sys_locale = system_locale(locale.LC_TIME)
     try:
-        return babel.dates.format_time(time, format="short", locale=sys_locale)
+        return babel.dates.format_time(time, format="HH:mm", locale=sys_locale)
     except babel.core.UnknownLocaleError:
         # Some locale types are not supported by the babel library.
         # Use 'en' locale format if the system locale is not supported.
-        return babel.dates.format_time(time, format="short", locale="en")
+        return babel.dates.format_time(time, format="HH:mm", locale="en")
 
 
 def mkdir(path):

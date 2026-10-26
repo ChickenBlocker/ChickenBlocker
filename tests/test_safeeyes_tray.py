@@ -65,6 +65,12 @@ class DaemonScheduleReaderTests(TestCase):
 
 
 class TrayDisplayTests(TestCase):
+    def test_times_use_24_hour_format(self):
+        self.assertEqual(
+            tray.utility.format_time(datetime.datetime(2026, 1, 1, 17, 5)),
+            "17:05",
+        )
+
     def test_interval_uses_daemon_cycle(self):
         # Regression: with the neutered config the tray computed
         # ceil(10080/10080) = "1/1". It must show the daemon's X/4.

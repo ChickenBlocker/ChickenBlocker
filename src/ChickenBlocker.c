@@ -598,6 +598,9 @@ _Static_assert(NIGHT_START_HOUR == 0, "night must always start at 00:00");
 // holding the dialog and abandons the "press to start" gate. Written/removed
 // by the plugin (runs as the user) in /tmp (user-writable).
 #define SE_STARTWORK_FLAG "/tmp/cb_startwork_dialog"
+#ifndef SE_REFRESH_FILE
+#define SE_REFRESH_FILE "/tmp/cb_safeeyes_refresh"
+#endif
 
 struct SafeEyesState {
 	int se_strict;        // -1 unknown, 0 day, 1 night (mode currently seeded)
@@ -925,8 +928,8 @@ static void de_killguard(struct passwd *pw, int dry, int lock_power) {
 			printf("KILLGUARD: chmod %s failed: %s\n", path, strerror(errno));
 		}
 	}
-	// Keep the panel's shutdown/restart dialog available during work, but deny
-	// its launcher while a SafeEyes break (including the night break) is active.
+	// Keep the panel's shutdown/restart dialog available during work and while
+	// the Start-work gate is up, but deny it during an actual SafeEyes break.
 	struct stat logout_st;
 	mode_t logout_mode = lock_power ? 0000 : 0755;
 	if (stat(session_logout, &logout_st) == 0
@@ -2952,6 +2955,17 @@ static time_t pause_cycle_deadline(time_t cycle_start,
 	return cycle_end;
 }
 
+// The user-session Safe Eyes plugin writes this flag when the Start-work gate
+// is released or logind reports resume. Consume it from the daemon's 1-second
+// poll so schedule/state publication does not wait for the 28-second cycle.
+static int se_refresh_requested(int consume) {
+	if (access(SE_REFRESH_FILE, F_OK) != 0) return 0;
+	if (consume && unlink(SE_REFRESH_FILE) != 0 && errno != ENOENT)
+		fprintf(stderr, "SAFEEYES: could not consume refresh request: %s\n",
+			strerror(errno));
+	return 1;
+}
+
 // Run the pause poll loop for at most CYCLE_BUDGET seconds: keep the abstract
 // socket open, accept + verify + handle cb-pause clients, and check the
 // per-question timeout and unblock-window end at 1s granularity. If an active
@@ -2976,6 +2990,11 @@ static void pause_run(struct passwd *pw, const char *ff_sync_sqlite,
 				if (c >= 0) { dirty |= pause_handle_conn(c, pw, ff_sync_sqlite, dry, st); close(c); }
 			}
 		} else sleep(1);
+		if (se_refresh_requested(!dry)) {
+			printf("SAFEEYES: immediate refresh requested\n");
+			if (dirty) write_state(st);
+			break;
+		}
 		if (time(NULL) >= cycle_end) {
 			if (dirty) write_state(st);
 			break;
@@ -3425,12 +3444,14 @@ int main(void) {
 		se_read_state(&se);
 		safeeyes_run(pw, dry, &se);
 		enforcement_deadline = se.se_work_end;
-		// Power button lock is break-scoped: night (always a break) or an
-		// active DAY break overlay (se_break_active; night never sets it).
+		// The persisted break bit stays set while the post-break Start-work
+		// dialog is up because safeeyes_run() deliberately leaves SafeEyes alone.
+		// That dialog (including an idle/away gate) is not an active break.
 		time_t now_kb = time(NULL);
 		struct tm tm_kb; localtime_r(&now_kb, &tm_kb);
 		de_killguard(pw, dry,
-			night_mode_active(&tm_kb) || se.se_break_active);
+			night_mode_active(&tm_kb)
+				|| (se.se_break_active && access(SE_STARTWORK_FLAG, F_OK) != 0));
 		vt_night_guard(night_mode_active(&tm_kb), dry);
 	}
 
@@ -3453,7 +3474,8 @@ int main(void) {
 		time_t now_kb = time(NULL);
 		struct tm tm_kb; localtime_r(&now_kb, &tm_kb);
 		de_killguard(pw, dry,
-			night_mode_active(&tm_kb) || se.se_break_active);
+			night_mode_active(&tm_kb)
+				|| (se.se_break_active && access(SE_STARTWORK_FLAG, F_OK) != 0));
 		vt_night_guard(night_mode_active(&tm_kb), dry);
 	}
 

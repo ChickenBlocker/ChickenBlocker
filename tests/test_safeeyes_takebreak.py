@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor"))
 
-from safeeyes.core import SafeEyesCore  # noqa: E402
+from safeeyes.core import SafeEyesCore, _natural_wait_seconds  # noqa: E402
 from safeeyes.model import Break, BreakQueue, BreakType, State  # noqa: E402
 from safeeyes import utility  # noqa: E402
 
@@ -100,6 +100,15 @@ class ExplicitBreakTypeTests(TestCase):
         selected = queue.next(BreakType.LONG_BREAK)
 
         self.assertEqual(selected.type, BreakType.LONG_BREAK)
+
+
+class DaemonOwnedSchedulerTests(TestCase):
+    def test_stale_short_queue_time_cannot_fire_naturally(self):
+        self.assertEqual(_natural_wait_seconds(0), 7 * 24 * 60 * 60)
+        self.assertEqual(_natural_wait_seconds(1), 7 * 24 * 60 * 60)
+
+    def test_longer_configured_wait_is_preserved(self):
+        self.assertEqual(_natural_wait_seconds(8 * 24 * 60), 8 * 24 * 60 * 60)
 
 
 class DoPreBreakStoppedCoreTests(TestCase):
