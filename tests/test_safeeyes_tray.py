@@ -46,10 +46,20 @@ def _fake_tray(active=True):
 class DaemonScheduleReaderTests(TestCase):
     def test_parses_fields(self):
         with _TmpSchedule("night=0\nnext_break=100\nnext_long=400\n"
-                          "interval=3\ntotal=4\n"):
+                          "interval=3\ntotal=4\ncal_configured=1\n"
+                          "cal_ok=500\ncal_fail=600\n"):
             sched = tray._cb_read_daemon_schedule()
         self.assertEqual(sched, {"night": 0, "next_break": 100,
-                                 "next_long": 400, "interval": 3, "total": 4})
+                                 "next_long": 400, "interval": 3, "total": 4,
+                                 "cal_configured": 1, "cal_ok": 500,
+                                 "cal_fail": 600})
+
+    def test_calendar_fields_default_to_zero(self):
+        with _TmpSchedule("night=0\n"):
+            sched = tray._cb_read_daemon_schedule()
+        self.assertEqual(sched["cal_configured"], 0)
+        self.assertEqual(sched["cal_ok"], 0)
+        self.assertEqual(sched["cal_fail"], 0)
 
     def test_missing_file_is_none(self):
         tray.CB_SCHEDULE_FILE = "/tmp/definitely-not-here-cb-schedule"
@@ -62,6 +72,110 @@ class DaemonScheduleReaderTests(TestCase):
     def test_garbage_value_is_none(self):
         with _TmpSchedule("night=soon\n"):
             self.assertIsNone(tray._cb_read_daemon_schedule())
+
+
+class CalendarStatusTests(TestCase):
+    def _status(self, content):
+        with _TmpSchedule(content):
+            return tray._cb_calendar_status()
+
+    def test_unconfigured_is_hidden(self):
+        self.assertIsNone(self._status(
+            "night=0\ncal_configured=0\ncal_ok=100\ncal_fail=200\n"))
+
+    def test_daemon_down_is_hidden(self):
+        tray.CB_SCHEDULE_FILE = "/tmp/definitely-not-here-cb-schedule"
+        self.assertIsNone(tray._cb_calendar_status())
+
+    def test_never_synced(self):
+        (label, failing) = self._status("night=0\ncal_configured=1\n")
+        self.assertTrue(failing)
+        self.assertIn("never synced", label)
+
+    def test_recent_ok_shows_time(self):
+        ok = datetime.datetime.now().timestamp() - 120
+        (label, failing) = self._status(
+            f"night=0\ncal_configured=1\ncal_ok={int(ok)}\ncal_fail=0\n")
+        self.assertFalse(failing)
+        self.assertIn(tray.utility.format_time(
+            datetime.datetime.fromtimestamp(ok)), label)
+
+    def test_ok_after_fail_is_healthy(self):
+        ok = datetime.datetime.now().timestamp() - 120
+        (label, failing) = self._status(
+            f"night=0\ncal_configured=1\ncal_ok={int(ok)}\ncal_fail={int(ok) - 3600}\n")
+        self.assertFalse(failing)
+        self.assertNotIn("failing", label)
+
+    def test_failing_today_shows_time(self):
+        fail = datetime.datetime.now().timestamp() - 120
+        (label, failing) = self._status(
+            f"night=0\ncal_configured=1\ncal_ok=0\ncal_fail={int(fail)}\n")
+        self.assertTrue(failing)
+        self.assertIn("failing", label)
+        self.assertIn(tray.utility.format_time(
+            datetime.datetime.fromtimestamp(fail)), label)
+
+    def test_failing_old_shows_date(self):
+        # The silent-OAuth-expiry shape: last failure days ago must render
+        # as a DATE, not a misleading HH:MM.
+        fail = datetime.datetime.now().timestamp() - 5 * 86400
+        (label, failing) = self._status(
+            f"night=0\ncal_configured=1\ncal_ok=0\ncal_fail={int(fail)}\n")
+        self.assertTrue(failing)
+        self.assertIn("failing", label)
+        self.assertIn(datetime.datetime.fromtimestamp(fail)
+                      .strftime("%Y-%m-%d"), label)
+
+    def _fake_tooltip_tray(self, next_break=None):
+        return SimpleNamespace(
+            plugin_config={"show_time_in_tray": False},
+            get_next_break_time=Mock(return_value=next_break),
+            sni_service=Mock(),
+        )
+
+    def test_tooltip_renamed_and_carries_failure(self):
+        fake = self._fake_tooltip_tray()
+        fail = datetime.datetime.now().timestamp() - 120
+        with _TmpSchedule(
+                f"night=0\ncal_configured=1\ncal_ok=0\ncal_fail={int(fail)}\n"):
+            tray.TrayIcon.update_tooltip(fake)
+        fake.sni_service.set_tooltip.assert_called_once()
+        (title, description) = fake.sni_service.set_tooltip.call_args[0]
+        self.assertEqual(title, "ChickenBlocker")
+        self.assertIn("failing", description)
+
+    def test_tooltip_clean_when_sync_healthy(self):
+        fake = self._fake_tooltip_tray()
+        ok = datetime.datetime.now().timestamp() - 120
+        with _TmpSchedule(
+                f"night=0\ncal_configured=1\ncal_ok={int(ok)}\ncal_fail=0\n"):
+            tray.TrayIcon.update_tooltip(fake)
+        (title, description) = fake.sni_service.set_tooltip.call_args[0]
+        self.assertEqual(title, "ChickenBlocker")
+        self.assertNotIn("Calendar", description)
+
+    def test_menu_item_hidden_when_unconfigured(self):
+        with _TmpSchedule("night=0\ncal_configured=0\n"):
+            item = tray._cb_calendar_menu_item()
+        self.assertTrue(item["hidden"])
+
+    def test_menu_item_shows_warning_when_failing(self):
+        fail = datetime.datetime.now().timestamp() - 120
+        with _TmpSchedule(
+                f"night=0\ncal_configured=1\ncal_ok=0\ncal_fail={int(fail)}\n"):
+            item = tray._cb_calendar_menu_item()
+        self.assertFalse(item.get("hidden", False))
+        self.assertIn("failing", item["label"])
+        self.assertEqual(item["icon-name"], "dialog-warning")
+
+    def test_menu_item_has_no_warning_icon_when_ok(self):
+        ok = datetime.datetime.now().timestamp() - 120
+        with _TmpSchedule(
+                f"night=0\ncal_configured=1\ncal_ok={int(ok)}\ncal_fail=0\n"):
+            item = tray._cb_calendar_menu_item()
+        self.assertFalse(item.get("hidden", False))
+        self.assertNotIn("icon-name", item)
 
 
 class TrayDisplayTests(TestCase):

@@ -40,10 +40,10 @@ tray_icon: typing.Optional["TrayIcon"] = None
 # built-in scheduler is neutered (huge intervals), so the times computed
 # from it would be nonsense ("next break in 7 days", "Interval 1/1"). The
 # daemon publishes the REAL schedule (next break, next long break, current
-# cycle X/4, night flag) to this file every ~30s cycle via an atomic
-# rename; the tray watches it with a Gio.FileMonitor and refreshes on
-# every republish. If the file is missing or stale (daemon down), fall
-# back to the upstream computation.
+# cycle X/4, night flag, calendar sync health) to this file every ~30s
+# cycle via an atomic rename; the tray watches it with a Gio.FileMonitor
+# and refreshes on every republish. If the file is missing or stale
+# (daemon down), fall back to the upstream computation.
 CB_SCHEDULE_FILE = "/tmp/cb_se_schedule"
 CB_SCHEDULE_STALE_SECS = 300
 
@@ -58,7 +58,16 @@ def _cb_read_daemon_schedule():
         return None
     if age > CB_SCHEDULE_STALE_SECS:
         return None
-    sched = {"night": 0, "next_break": 0, "next_long": 0, "interval": 0, "total": 4}
+    sched = {
+        "night": 0,
+        "next_break": 0,
+        "next_long": 0,
+        "interval": 0,
+        "total": 4,
+        "cal_configured": 0,
+        "cal_ok": 0,
+        "cal_fail": 0,
+    }
     for line in raw.splitlines():
         if "=" not in line:
             continue
@@ -70,6 +79,35 @@ def _cb_read_daemon_schedule():
             except ValueError:
                 return None
     return sched
+
+
+def _cb_calendar_status():
+    """VENDORED PATCH (ChickenBlocker): describe the daemon's calendar
+    sync health for the tray menu/tooltip.
+
+    Returns (label, failing) or None when there is nothing to show
+    (daemon down, schedule stale, or the calendar was never configured).
+    The daemon records se_cal_ok/se_cal_fail (persisted across restarts)
+    and republishes them with every schedule refresh, so a dead OAuth
+    token shows as "sync failing since DATE" instead of failing silently.
+    """
+    sched = _cb_read_daemon_schedule()
+    if sched is None or not sched["cal_configured"]:
+        return None
+    ok = sched["cal_ok"]
+    fail = sched["cal_fail"]
+    if ok <= 0 and fail <= 0:
+        return (_("Calendar: never synced"), True)
+    failing = fail > 0 and fail >= ok
+    when = datetime.datetime.fromtimestamp(fail if failing else ok)
+    if when.date() == datetime.date.today():
+        stamp = utility.format_time(when)
+    else:
+        # Older than today: HH:MM would be misleading; show the date.
+        stamp = when.strftime("%Y-%m-%d")
+    if failing:
+        return (_("Calendar: sync failing since %s") % (stamp,), True)
+    return (_("Calendar: synced %s") % (stamp,), False)
 safeeyes_config = None
 
 SNI_NODE_INFO = Gio.DBusNodeInfo.new_for_xml(
@@ -413,11 +451,13 @@ class StatusNotifierItemService(DBusService):
 
     Category = "ApplicationStatus"
     Id = "io.github.slgobinath.SafeEyes"
-    Title = "Safe Eyes"
+    # VENDORED PATCH (ChickenBlocker): the indicator is repurposed as the
+    # ChickenBlocker status icon (breaks + calendar health display).
+    Title = "ChickenBlocker"
     Status = "Active"
     IconName = "io.github.slgobinath.SafeEyes-enabled"
     IconThemePath = ""
-    ToolTip: tuple[str, list[typing.Any], str, str] = ("", [], "Safe Eyes", "")
+    ToolTip: tuple[str, list[typing.Any], str, str] = ("", [], "ChickenBlocker", "")
     XAyatanaLabel = ""
     ItemIsMenu = True
     Menu = None
@@ -513,6 +553,20 @@ class StatusNotifierItemService(DBusService):
     def SecondaryActivate(self, x: int, y: int) -> None:
         if self._on_secondary_activate is not None:
             self._on_secondary_activate()
+
+
+def _cb_calendar_menu_item():
+    """VENDORED PATCH (ChickenBlocker): disabled info row mirroring the
+    daemon's calendar sync status. None -> placeholder dict hidden from
+    the menu (keeps the item order stable)."""
+    status = _cb_calendar_status()
+    if status is None:
+        return {"id": 15, "label": "", "enabled": False, "hidden": True}
+    (label, failing) = status
+    item = {"id": 15, "label": label, "enabled": False}
+    if failing:
+        item["icon-name"] = "dialog-warning"
+    return item
 
 
 class TrayIcon:
@@ -714,6 +768,10 @@ class TrayIcon:
                 "enabled": False,
                 "hidden": interval_message is None,
             },
+            # VENDORED PATCH (ChickenBlocker): calendar sync health line
+            # (hidden when the calendar is unconfigured or the daemon is
+            # down; warning icon while the sync keeps failing).
+            _cb_calendar_menu_item(),
             {
                 "id": 1,
                 "label": info_message,
@@ -785,7 +843,17 @@ class TrayIcon:
         else:
             description = ""
 
-        self.sni_service.set_tooltip("Safe Eyes", description)
+        # VENDORED PATCH (ChickenBlocker): surface a failing calendar sync
+        # on hover too — an expired OAuth token must not fail silently.
+        calendar = _cb_calendar_status()
+        if calendar is not None and calendar[1]:
+            description = (
+                description + " | " + calendar[0]
+                if description
+                else calendar[0]
+            )
+
+        self.sni_service.set_tooltip("ChickenBlocker", description)
         self.sni_service.set_xayatanalabel(description)
 
     def quit_safe_eyes(self):

@@ -159,11 +159,15 @@ int main(void) {
 	assert(skip == 1);
 
 	// Tray schedule publisher: work armed + cycle 3 -> next break IS the
-	// long one, interval line 4/4.
+	// long one, interval line 4/4. The cal_* lines must always be
+	// published (tray hides the status only when cal_configured=0).
 	{
 		struct SafeEyesState sched_st = {0};
 		sched_st.se_cycle = 3;
 		sched_st.se_work_end = 2000000;
+		sched_st.se_cal_cfg = 1;
+		sched_st.se_cal_ok = 1000000;
+		sched_st.se_cal_fail = 1003600;
 		se_write_schedule(&sched_st, 0, 1500000);
 		size_t n = 0;
 		char *buf = read_file(SE_SCHEDULE_FILE, &n);
@@ -173,6 +177,9 @@ int main(void) {
 		assert(strstr(buf, "next_long=2000000"));
 		assert(strstr(buf, "interval=4"));
 		assert(strstr(buf, "total=4"));
+		assert(strstr(buf, "cal_configured=1"));
+		assert(strstr(buf, "cal_ok=1000000"));
+		assert(strstr(buf, "cal_fail=1003600"));
 		free(buf);
 		struct SafeEyesState night_st = {0};
 		se_write_schedule(&night_st, 1, 1500000);
@@ -180,6 +187,9 @@ int main(void) {
 		assert(buf != NULL);
 		assert(strstr(buf, "night=1"));
 		assert(strstr(buf, "interval=0"));
+		assert(strstr(buf, "cal_configured=0"));
+		assert(strstr(buf, "cal_ok=0"));
+		assert(strstr(buf, "cal_fail=0"));
 		free(buf);
 		unlink(SE_SCHEDULE_FILE);
 	}

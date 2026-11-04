@@ -659,6 +659,14 @@ struct SafeEyesState {
 	                       // config's 1-min interval) can never fire a
 	                       // natural break.
 	char se_cal_hour[16]; // last attempted local calendar hour (YYYY-MM-DDTHH)
+	time_t se_cal_ok;     // wall-clock of the last SUCCESSFUL calendar sync
+	                      // (0 = never). Persisted so a restart does not lose
+	                      // the status shown in the tray.
+	time_t se_cal_fail;   // wall-clock of the last FAILED calendar sync
+	                      // attempt (0 = none). se_cal_fail >= se_cal_ok
+	                      // means the sync is currently broken.
+	int se_cal_cfg;       // 0/1: calendar sync was configured at the last
+	                      // check (tray hides the status line when 0).
 	int se_meeting_phase; // 0 idle, 1 waiting for camera, 2 camera confirmed
 	char se_meeting_id[65];
 	time_t se_meeting_end;
@@ -1087,6 +1095,9 @@ static int se_read_state(struct SafeEyesState *st) {
 	st->se_src_hash = 0;
 	st->se_neutered = 0;
 	st->se_cal_hour[0] = 0;
+	st->se_cal_ok = 0;
+	st->se_cal_fail = 0;
+	st->se_cal_cfg = 0;
 	st->se_meeting_phase = 0;
 	st->se_meeting_id[0] = 0;
 	st->se_meeting_end = 0;
@@ -1118,6 +1129,9 @@ static int se_read_state(struct SafeEyesState *st) {
 		else if (!strcmp(line, "se_src_hash")) st->se_src_hash = strtoul(v, NULL, 10);
 		else if (!strcmp(line, "se_neutered")) st->se_neutered = atoi(v);
 		else if (!strcmp(line, "se_cal_hour")) snprintf(st->se_cal_hour, sizeof st->se_cal_hour, "%s", v);
+		else if (!strcmp(line, "se_cal_ok")) st->se_cal_ok = (time_t)atoll(v);
+		else if (!strcmp(line, "se_cal_fail")) st->se_cal_fail = (time_t)atoll(v);
+		else if (!strcmp(line, "se_cal_cfg")) st->se_cal_cfg = atoi(v) ? 1 : 0;
 		else if (!strcmp(line, "se_meeting_phase")) st->se_meeting_phase = atoi(v);
 		else if (!strcmp(line, "se_meeting_id")) snprintf(st->se_meeting_id, sizeof st->se_meeting_id, "%s", v);
 		else if (!strcmp(line, "se_meeting_end")) st->se_meeting_end = (time_t)atoll(v);
@@ -1151,6 +1165,9 @@ static void se_write_state(const struct SafeEyesState *st) {
 	fprintf(f, "se_src_hash=%lu\n", st->se_src_hash);
 	fprintf(f, "se_neutered=%d\n", st->se_neutered);
 	fprintf(f, "se_cal_hour=%s\n", st->se_cal_hour);
+	fprintf(f, "se_cal_ok=%lld\n", (long long)st->se_cal_ok);
+	fprintf(f, "se_cal_fail=%lld\n", (long long)st->se_cal_fail);
+	fprintf(f, "se_cal_cfg=%d\n", st->se_cal_cfg);
 	fprintf(f, "se_meeting_phase=%d\n", st->se_meeting_phase);
 	fprintf(f, "se_meeting_id=%s\n", st->se_meeting_id);
 	fprintf(f, "se_meeting_end=%lld\n", (long long)st->se_meeting_end);
@@ -1517,6 +1534,9 @@ static int se_begin_pomodoro_day(struct SafeEyesState *st, const char *today) {
 // every cycle; the tray treats it as stale after 5 minutes without an
 // update. next_break <= 0 means "not scheduled yet" (Start-work gate,
 // disarmed); interval 0 hides the X/4 line (night).
+// The cal_* lines carry the calendar sync health (also persisted in
+// se_state) so the tray can show "synced HH:MM" / "sync failing since
+// DATE" — e.g. an expired OAuth token is visible instead of silent.
 // Written atomically (tmp file + rename) so a reader never sees a torn
 // file, and the rename itself is the event the tray's Gio.FileMonitor
 // refreshes on. (Overridable so the test harness can publish to a scratch
@@ -1569,6 +1589,9 @@ static void se_write_schedule(const struct SafeEyesState *st,
 	fprintf(f, "next_long=%lld\n", next_long);
 	fprintf(f, "interval=%d\n", interval);
 	fprintf(f, "total=4\n");
+	fprintf(f, "cal_configured=%d\n", st->se_cal_cfg);
+	fprintf(f, "cal_ok=%lld\n", (long long)st->se_cal_ok);
+	fprintf(f, "cal_fail=%lld\n", (long long)st->se_cal_fail);
 	if (fclose(f) != 0) {
 		unlink(tmp_path);
 		return;
@@ -1711,6 +1734,7 @@ static void calendar_schedule_run(struct passwd *pw, int dry,
 	char today[16];
 	local_date_for(now, today);
 	int configured = calendar_configured(pw);
+	if (!dry) st->se_cal_cfg = configured ? 1 : 0;
 	if (!configured) {
 		if (!dry) se_write_state(st);
 		return;
@@ -1723,8 +1747,11 @@ static void calendar_schedule_run(struct passwd *pw, int dry,
 			printf("DRY RUN: %scalendar sync for hour %s\n",
 				requested ? "manually requested " : "", st->se_cal_hour);
 		} else if (meeting_ledger_reconcile(pw, ledger, today) != 0) {
+			st->se_cal_fail = now;
 			fprintf(stderr, "ChickenBlocker: %scalendar sync for hour %s failed\n",
 				requested ? "manually requested " : "", st->se_cal_hour);
+		} else {
+			st->se_cal_ok = now;
 		}
 	}
 	if (!dry) se_write_state(st);
