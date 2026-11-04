@@ -53,6 +53,10 @@ profile shell-bpf /usr/bin/{bash,sh,dash,python3,perl,bpftool} flags=(default_al
   # by apparmor_parser >= 4.x/5.x; "rw" denies both read and write bpf ops.
   deny bpf rw,
 
+  # LightDM starts Xubuntu sessions through a confined /bin/sh. Do not pass that
+  # label to the full desktop, where it conflicts with snap D-Bus peer rules.
+  /usr/bin/xfce4-session ux,
+
   # Grant the SEND side of signals from this profile. NOTE: this does NOT
   # guarantee delivery - the TARGET's profile must also grant
   # `signal (receive) peer=shell-bpf`. Snaps only allow receive from
